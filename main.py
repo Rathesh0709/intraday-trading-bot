@@ -559,6 +559,7 @@ def list_bots(user_id: UUID):
             .select("*") \
             .eq("user_id", str(user_id)) \
             .neq("mode", GENERAL_MODE) \
+            .neq("status", "deleted") \
             .order("created_at", desc=True) \
             .execute()
         general = _get_general_bot()
@@ -568,6 +569,41 @@ def list_bots(user_id: UUID):
         }
     except Exception as e:
         _raise_api_error(e, "List bots failed")
+
+
+@app.get("/bots/history")
+def list_bots_history(user_id: UUID):
+    """
+    Return all custom bots for the user including deleted/inactive ones.
+    """
+    try:
+        rows = get_supabase().table("bot_instances") \
+            .select("*") \
+            .eq("user_id", str(user_id)) \
+            .neq("mode", GENERAL_MODE) \
+            .order("created_at", desc=True) \
+            .execute()
+        return {"custom_bots_history": rows.data or []}
+    except Exception as e:
+        _raise_api_error(e, "List bots history failed")
+
+
+@app.delete("/bot/{bot_id}")
+def delete_bot(bot_id: str, user_id: UUID):
+    """
+    Soft delete custom bot by marking status=deleted.
+    General bot cannot be deleted.
+    """
+    try:
+        bot = _require_bot_access(bot_id, user_id)
+        if bot.get("mode") == GENERAL_MODE:
+            raise HTTPException(status_code=400, detail="General bot cannot be deleted.")
+        get_supabase().table("bot_instances").update({"status": "deleted"}).eq("id", bot_id).execute()
+        return {"message": f"Bot {bot_id} deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_api_error(e, "Delete bot failed")
 
 
 @app.get("/ops/scheduler-health")
