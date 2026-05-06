@@ -34,6 +34,16 @@ def _pick_existing(paths: tuple[str, ...], required: bool = False) -> Optional[s
     return None
 
 
+def _safe_optional_load(path: Optional[str], name: str):
+    if not path:
+        return None
+    try:
+        return joblib.load(path)
+    except Exception as exc:
+        print(f"[Models] Skipping optional {name} ({path}): {exc}")
+        return None
+
+
 def load_models() -> dict:
     """Load all trained models from disk (cached after first load)."""
     global _models_cache
@@ -43,13 +53,13 @@ def load_models() -> dict:
     scaler_path = _pick_existing(SCALER_CANDIDATES, required=True)
     features_path = _pick_existing(FEATURE_COLS_CANDIDATES, required=True)
 
-    xgb_path = _pick_existing(XGB_MODEL_CANDIDATES)
+    xgb_path = _pick_existing(XGB_MODEL_CANDIDATES, required=True)
     lgb_path = _pick_existing(LGB_MODEL_CANDIDATES)
     cat_path = _pick_existing(CAT_MODEL_CANDIDATES)
 
-    xgb_m = joblib.load(xgb_path) if xgb_path else None
-    lgb_m = joblib.load(lgb_path) if lgb_path else None
-    cat_m = joblib.load(cat_path) if cat_path else None
+    xgb_m = joblib.load(xgb_path)
+    lgb_m = _safe_optional_load(lgb_path, "LightGBM model")
+    cat_m = _safe_optional_load(cat_path, "CatBoost model")
     scaler = joblib.load(scaler_path)
     feature_cols = joblib.load(features_path)
     if hasattr(feature_cols, "tolist"):
@@ -78,7 +88,8 @@ def models_ready() -> bool:
     try:
         load_models()
         return True
-    except FileNotFoundError:
+    except Exception as exc:
+        print(f"[Models] Not ready: {exc}")
         return False
 
 
