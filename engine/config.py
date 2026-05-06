@@ -54,11 +54,32 @@ NIFTY_50_TICKERS = [
     "INDUSINDBK.NS","SBILIFE.NS","LTIM.NS","BEL.NS",
 ]
 
-# Model file names (must be present in models/ folder)
-MODEL_DIR          = "models"
-XGB_MODEL_FILE     = f"{MODEL_DIR}/xgb_model.pkl"
-LGB_MODEL_FILE     = f"{MODEL_DIR}/lgb_model.pkl"
-CAT_MODEL_FILE     = f"{MODEL_DIR}/cat_model.pkl"
-TCN_MODEL_FILE     = f"{MODEL_DIR}/tcn_model.pkl"
-SCALER_FILE        = f"{MODEL_DIR}/scaler.pkl"
-FEATURE_COLS_FILE  = f"{MODEL_DIR}/feature_cols.pkl"
+# Model files expected in models/ folder.
+# Includes both backend aliases and filenames produced by stock_trading_bot.py.
+MODEL_DIR = "models"
+
+XGB_MODEL_CANDIDATES = (
+    f"{MODEL_DIR}/xgb_model.pkl",
+    f"{MODEL_DIR}/nifty_xgb_model.pkl",
+)
+LGB_MODEL_CANDIDATES = (
+    f"{MODEL_DIR}/lgb_model.pkl",
+    f"{MODEL_DIR}/nifty_lgb_model.pkl",
+)
+CAT_MODEL_CANDIDATES = (
+    f"{MODEL_DIR}/cat_model.pkl",
+    f"{MODEL_DIR}/nifty_cat_model.pkl",
+)
+TCN_MODEL_CANDIDATES = (
+    f"{MODEL_DIR}/tcn_model.keras",
+    f"{MODEL_DIR}/nifty_tcn_model.keras",
+    f"{MODEL_DIR}/tcn_model.pkl",
+)
+SCALER_CANDIDATES = (
+    f"{MODEL_DIR}/scaler.pkl",
+    f"{MODEL_DIR}/nifty_scaler.pkl",
+)
+FEATURE_COLS_CANDIDATES = (
+    f"{MODEL_DIR}/feature_cols.pkl",
+    f"{MODEL_DIR}/nifty_features.pkl",
+)
