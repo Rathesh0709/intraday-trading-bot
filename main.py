@@ -1,6 +1,7 @@
 import os
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,20 @@ from engine.paper import run_cycle
 
 # ── Scheduler ───────────────────────────────────────────────────────────────
 scheduler = AsyncIOScheduler()
+
+
+def _safe_insert_cycle_log(bot_id: str, payload: dict) -> None:
+    """
+    Persist cycle logs when bot_cycle_logs table exists.
+    Non-blocking by design: logging failures should never break trading flow.
+    """
+    try:
+        get_supabase().table("bot_cycle_logs").insert({
+            "bot_id": bot_id,
+            "payload": payload,
+        }).execute()
+    except Exception as e:
+        print(f"[Scheduler] bot_cycle_logs insert skipped: {e}")
 
 def _raise_api_error(exc: Exception, context: str) -> None:
     """Map dependency/runtime exceptions to clean API responses."""
@@ -85,6 +100,7 @@ async def scheduled_paper_run():
         try:
             log = run_cycle(b["id"], df_5m, df_1h)
             print(f"[Scheduler] Bot {b['id']} cycle complete: {log['cycle_pnl']} PnL")
+            _safe_insert_cycle_log(b["id"], log)
         except Exception as e:
             print(f"[Scheduler] Error running bot {b['id']}: {e}")
 
@@ -244,3 +260,78 @@ def get_bot_history(bot_id: str):
         return {"trades": trades.data}
     except Exception as e:
         _raise_api_error(e, "Get bot history failed")
+
+
+@app.get("/bot/{bot_id}/dashboard")
+def get_bot_dashboard(bot_id: str):
+    """
+    Dashboard data for frontend cards:
+    - current positions with live unrealized PnL
+    - today's realized PnL and trade count
+    - cumulative realized PnL
+    """
+    try:
+        sb = get_supabase()
+        bot = sb.table("bot_instances").select("*").eq("id", bot_id).single().execute()
+        positions = sb.table("positions").select("*").eq("bot_id", bot_id).execute()
+        trades = sb.table("trades").select("*").eq("bot_id", bot_id).execute()
+
+        open_positions = positions.data or []
+        all_trades = trades.data or []
+
+        # Compute today's realized PnL (UTC date for consistency with DB timestamps)
+        today = datetime.utcnow().date().isoformat()
+        today_trades = [
+            t for t in all_trades
+            if str(t.get("exit_time", "")).startswith(today)
+        ]
+        realized_today = sum(float(t.get("pnl", 0) or 0) for t in today_trades)
+        realized_total = sum(float(t.get("pnl", 0) or 0) for t in all_trades)
+
+        # Live prices for open positions
+        tickers = [p["ticker"] for p in open_positions]
+        latest_prices = get_latest_prices(tickers)
+        enriched_positions = []
+        for p in open_positions:
+            cur = latest_prices.get(p["ticker"], float(p["entry_price"]))
+            unrealized = (cur - float(p["entry_price"])) * p["qty"] * p["direction"]
+            enriched_positions.append({
+                **p,
+                "current_price": cur,
+                "unrealized_pnl": round(unrealized, 2),
+            })
+
+        return {
+            "bot": bot.data,
+            "positions": enriched_positions,
+            "stats": {
+                "open_positions": len(enriched_positions),
+                "trades_today": len(today_trades),
+                "realized_pnl_today": round(realized_today, 2),
+                "realized_pnl_total": round(realized_total, 2),
+                "unrealized_pnl_open": round(
+                    sum(float(p["unrealized_pnl"]) for p in enriched_positions), 2
+                ),
+            },
+        }
+    except Exception as e:
+        _raise_api_error(e, "Get bot dashboard failed")
+
+
+@app.get("/bot/{bot_id}/logs")
+def get_bot_logs(bot_id: str, limit: int = 30):
+    """
+    Read per-cycle bot logs if bot_cycle_logs table exists.
+    """
+    try:
+        sb = get_supabase()
+        rows = sb.table("bot_cycle_logs") \
+            .select("*") \
+            .eq("bot_id", bot_id) \
+            .order("created_at", desc=True) \
+            .limit(max(1, min(limit, 200))) \
+            .execute()
+        return {"logs": rows.data or []}
+    except Exception as e:
+        # Keep this non-fatal for clients that haven't created bot_cycle_logs yet.
+        return {"logs": [], "warning": f"bot_cycle_logs unavailable: {e}"}
