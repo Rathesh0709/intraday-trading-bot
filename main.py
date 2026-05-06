@@ -15,9 +15,12 @@ from db.client import get_supabase
 from engine.signals import models_ready
 from engine.data import fetch_live_candles, get_latest_prices
 from engine.paper import run_cycle
+from engine.config import NIFTY_50_TICKERS, INITIAL_CAPITAL
 
 # ── Scheduler ───────────────────────────────────────────────────────────────
 scheduler = AsyncIOScheduler()
+GENERAL_BOT_OWNER_ID = "00000000-0000-0000-0000-000000000001"
+GENERAL_MODE = "general"
 
 
 def _safe_insert_cycle_log(bot_id: str, payload: dict) -> None:
@@ -32,6 +35,53 @@ def _safe_insert_cycle_log(bot_id: str, payload: dict) -> None:
         }).execute()
     except Exception as e:
         print(f"[Scheduler] bot_cycle_logs insert skipped: {e}")
+
+
+def _get_general_bot() -> Optional[dict]:
+    try:
+        r = get_supabase().table("bot_instances") \
+            .select("*") \
+            .eq("mode", GENERAL_MODE) \
+            .order("created_at") \
+            .limit(1) \
+            .execute()
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _ensure_general_bot(now_ist: datetime) -> Optional[dict]:
+    """
+    Ensure singleton general bot exists and is auto-started/stopped by time.
+    Trading window: 09:00–16:00 IST.
+    """
+    sb = get_supabase()
+    bot = _get_general_bot()
+    should_run = 9 <= now_ist.hour < 16
+
+    if bot is None:
+        payload = {
+            "user_id": GENERAL_BOT_OWNER_ID,
+            "mode": GENERAL_MODE,
+            "initial_capital": float(INITIAL_CAPITAL),
+            "current_capital": float(INITIAL_CAPITAL),
+            "tickers": NIFTY_50_TICKERS,
+            "status": "running" if should_run else "stopped",
+        }
+        res = sb.table("bot_instances").insert(payload).execute()
+        rows = res.data or []
+        bot = rows[0] if rows else None
+        if bot:
+            print(f"[General Bot] Created {bot['id']} with status={bot['status']}")
+        return bot
+
+    desired = "running" if should_run else "stopped"
+    if bot.get("status") != desired:
+        sb.table("bot_instances").update({"status": desired}).eq("id", bot["id"]).execute()
+        bot["status"] = desired
+        print(f"[General Bot] Auto-set status={desired}")
+    return bot
 
 def _raise_api_error(exc: Exception, context: str) -> None:
     """Map dependency/runtime exceptions to clean API responses."""
@@ -64,8 +114,10 @@ async def scheduled_paper_run():
         print("[Scheduler] Models not ready, skipping cycle.")
         return
 
-    print("[Scheduler] Starting hourly cycle...")
+    print("[Scheduler] Starting scheduled cycle...")
     try:
+        now_ist = datetime.now(__import__("pytz").timezone("Asia/Kolkata"))
+        _ensure_general_bot(now_ist)
         sb = get_supabase()
         # Get all active bots
         res = sb.table("bot_instances").select("*").eq("status", "running").execute()
@@ -112,7 +164,7 @@ async def lifespan(app: FastAPI):
     try:
         from pytz import timezone
         ist = timezone('Asia/Kolkata')
-        scheduler.add_job(scheduled_paper_run, 'cron', hour='10-15', minute='16', timezone=ist)
+        scheduler.add_job(scheduled_paper_run, 'cron', hour='9-16', minute='*/5', timezone=ist)
         scheduler.start()
         print("[App] Scheduler started.")
     except Exception as e:
@@ -335,3 +387,64 @@ def get_bot_logs(bot_id: str, limit: int = 30):
     except Exception as e:
         # Keep this non-fatal for clients that haven't created bot_cycle_logs yet.
         return {"logs": [], "warning": f"bot_cycle_logs unavailable: {e}"}
+
+
+def _build_dashboard(bot_id: str) -> dict:
+    sb = get_supabase()
+    bot = sb.table("bot_instances").select("*").eq("id", bot_id).single().execute()
+    positions = sb.table("positions").select("*").eq("bot_id", bot_id).execute()
+    trades = sb.table("trades").select("*").eq("bot_id", bot_id).execute()
+
+    open_positions = positions.data or []
+    all_trades = trades.data or []
+    today = datetime.utcnow().date().isoformat()
+    today_trades = [t for t in all_trades if str(t.get("exit_time", "")).startswith(today)]
+    realized_today = sum(float(t.get("pnl", 0) or 0) for t in today_trades)
+    realized_total = sum(float(t.get("pnl", 0) or 0) for t in all_trades)
+
+    tickers = [p["ticker"] for p in open_positions]
+    latest_prices = get_latest_prices(tickers)
+    enriched_positions = []
+    for p in open_positions:
+        cur = latest_prices.get(p["ticker"], float(p["entry_price"]))
+        unrealized = (cur - float(p["entry_price"])) * p["qty"] * p["direction"]
+        enriched_positions.append({
+            **p,
+            "current_price": cur,
+            "unrealized_pnl": round(unrealized, 2),
+        })
+
+    return {
+        "bot": bot.data,
+        "positions": enriched_positions,
+        "stats": {
+            "open_positions": len(enriched_positions),
+            "trades_today": len(today_trades),
+            "realized_pnl_today": round(realized_today, 2),
+            "realized_pnl_total": round(realized_total, 2),
+            "unrealized_pnl_open": round(
+                sum(float(p["unrealized_pnl"]) for p in enriched_positions), 2
+            ),
+        },
+    }
+
+
+@app.get("/bot/general/summary")
+def get_general_bot_summary(limit: int = 30):
+    """
+    Public-like overview endpoint for the auto-managed General Bot.
+    """
+    try:
+        bot = _get_general_bot()
+        if not bot:
+            return {"message": "General bot not initialized yet.", "bot": None, "logs": []}
+        dashboard = _build_dashboard(bot["id"])
+        logs = get_bot_logs(bot["id"], limit=limit)
+        return {
+            "bot_id": bot["id"],
+            "dashboard": dashboard,
+            "logs": logs.get("logs", []),
+            "logs_warning": logs.get("warning"),
+        }
+    except Exception as e:
+        _raise_api_error(e, "Get general bot summary failed")
