@@ -7,6 +7,7 @@ from __future__ import annotations
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import List
+import time
 
 
 def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
@@ -35,14 +36,23 @@ def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
 
     for ticker in tickers:
         try:
-            raw = yf.download(
-                ticker,
-                start=start_str,
-                end=end_str,
-                interval="5m",
-                progress=False,
-                auto_adjust=True,
-            )
+            raw = pd.DataFrame()
+            # Retry with small backoff for transient provider/network failures.
+            for attempt in range(3):
+                try:
+                    raw = yf.download(
+                        ticker,
+                        start=start_str,
+                        end=end_str,
+                        interval="5m",
+                        progress=False,
+                        auto_adjust=True,
+                    )
+                    if not raw.empty:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.6 * (attempt + 1))
             if raw.empty:
                 failed.append(ticker)
                 continue
@@ -94,8 +104,16 @@ def get_latest_prices(tickers: List[str]) -> dict[str, float]:
     prices = {}
     for ticker in tickers:
         try:
-            t = yf.Ticker(ticker)
-            hist = t.history(period="1d", interval="5m")
+            hist = pd.DataFrame()
+            for attempt in range(3):
+                try:
+                    t = yf.Ticker(ticker)
+                    hist = t.history(period="1d", interval="5m")
+                    if not hist.empty:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.4 * (attempt + 1))
             if not hist.empty:
                 prices[ticker] = float(hist["Close"].iloc[-1])
         except Exception:

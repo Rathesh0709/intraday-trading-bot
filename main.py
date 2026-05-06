@@ -10,6 +10,7 @@ from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import httpx
 from uuid import UUID
+import uuid
 
 from db.client import get_supabase
 from engine.signals import models_ready
@@ -21,6 +22,15 @@ from engine.config import NIFTY_50_TICKERS, INITIAL_CAPITAL
 scheduler = AsyncIOScheduler()
 GENERAL_BOT_OWNER_ID = "00000000-0000-0000-0000-000000000001"
 GENERAL_MODE = "general"
+SCHEDULER_STATE = {
+    "last_run_id": None,
+    "last_started_at": None,
+    "last_completed_at": None,
+    "last_duration_ms": None,
+    "last_status": "never_run",
+    "last_error": None,
+    "last_bots_processed": 0,
+}
 
 
 def _safe_insert_cycle_log(bot_id: str, payload: dict) -> None:
@@ -37,6 +47,17 @@ def _safe_insert_cycle_log(bot_id: str, payload: dict) -> None:
         print(f"[Scheduler] bot_cycle_logs insert skipped: {e}")
 
 
+def _safe_insert_cycle_metric(payload: dict) -> None:
+    """
+    Persist per-cycle execution metrics when table exists.
+    Non-blocking: metrics must not break scheduling.
+    """
+    try:
+        get_supabase().table("bot_cycle_metrics").insert(payload).execute()
+    except Exception as e:
+        print(f"[Scheduler] bot_cycle_metrics insert skipped: {e}")
+
+
 def _get_general_bot() -> Optional[dict]:
     try:
         r = get_supabase().table("bot_instances") \
@@ -49,6 +70,37 @@ def _get_general_bot() -> Optional[dict]:
         return rows[0] if rows else None
     except Exception:
         return None
+
+
+def _get_bot_row(bot_id: str) -> Optional[dict]:
+    try:
+        r = get_supabase().table("bot_instances") \
+            .select("*") \
+            .eq("id", bot_id) \
+            .limit(1) \
+            .execute()
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _require_bot_access(bot_id: str, user_id: Optional[UUID]) -> dict:
+    """
+    Authorize bot access:
+    - General bot is public/readable and controllable by design.
+    - Custom bot requires matching user_id.
+    """
+    bot = _get_bot_row(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found.")
+    if bot.get("mode") == GENERAL_MODE:
+        return bot
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="user_id required for custom bot access.")
+    if str(bot.get("user_id")) != str(user_id):
+        raise HTTPException(status_code=403, detail="You do not own this bot.")
+    return bot
 
 
 def _ensure_general_bot(now_ist: datetime) -> Optional[dict]:
@@ -114,7 +166,14 @@ async def scheduled_paper_run():
         print("[Scheduler] Models not ready, skipping cycle.")
         return
 
-    print("[Scheduler] Starting scheduled cycle...")
+    run_id = str(uuid.uuid4())
+    run_started_at = datetime.utcnow()
+    SCHEDULER_STATE["last_run_id"] = run_id
+    SCHEDULER_STATE["last_started_at"] = run_started_at.isoformat() + "Z"
+    SCHEDULER_STATE["last_status"] = "running"
+    SCHEDULER_STATE["last_error"] = None
+    SCHEDULER_STATE["last_bots_processed"] = 0
+    print(f"[Scheduler] Starting scheduled cycle run_id={run_id}")
     try:
         now_ist = datetime.now(__import__("pytz").timezone("Asia/Kolkata"))
         _ensure_general_bot(now_ist)
@@ -123,6 +182,8 @@ async def scheduled_paper_run():
         res = sb.table("bot_instances").select("*").eq("status", "running").execute()
         bots = res.data
     except Exception as e:
+        SCHEDULER_STATE["last_status"] = "error"
+        SCHEDULER_STATE["last_error"] = str(e)
         print(f"[Scheduler] Supabase unreachable, skipping cycle: {e}")
         return
     if not bots:
@@ -144,17 +205,72 @@ async def scheduled_paper_run():
     df_1h = data["1h"]
     
     if df_5m.empty:
+        SCHEDULER_STATE["last_status"] = "data_unavailable"
         print("[Scheduler] Failed to fetch live data. Skipping.")
         return
 
     # Run cycle for each bot
+    bots_processed = 0
     for b in bots:
+        cycle_started_at = datetime.utcnow()
         try:
             log = run_cycle(b["id"], df_5m, df_1h)
-            print(f"[Scheduler] Bot {b['id']} cycle complete: {log['cycle_pnl']} PnL")
-            _safe_insert_cycle_log(b["id"], log)
+            bots_processed += 1
+            cycle_completed_at = datetime.utcnow()
+            execution_ms = int((cycle_completed_at - cycle_started_at).total_seconds() * 1000)
+            structured = {
+                "event": "cycle_complete",
+                "bot_id": b["id"],
+                "mode": b.get("mode"),
+                "status": "ok",
+                "started_at": cycle_started_at.isoformat() + "Z",
+                "completed_at": cycle_completed_at.isoformat() + "Z",
+                "execution_ms": execution_ms,
+                "cycle": log,
+            }
+            print(f"[Scheduler] {structured}")
+            _safe_insert_cycle_log(b["id"], structured)
+            _safe_insert_cycle_metric({
+                "run_id": run_id,
+                "bot_id": b["id"],
+                "mode": b.get("mode"),
+                "status": "ok",
+                "execution_ms": execution_ms,
+                "started_at": cycle_started_at.isoformat() + "Z",
+                "completed_at": cycle_completed_at.isoformat() + "Z",
+                "cycle_pnl": (log or {}).get("cycle_pnl", 0.0),
+            })
         except Exception as e:
-            print(f"[Scheduler] Error running bot {b['id']}: {e}")
+            cycle_completed_at = datetime.utcnow()
+            execution_ms = int((cycle_completed_at - cycle_started_at).total_seconds() * 1000)
+            structured = {
+                "event": "cycle_complete",
+                "bot_id": b["id"],
+                "mode": b.get("mode"),
+                "status": "error",
+                "started_at": cycle_started_at.isoformat() + "Z",
+                "completed_at": cycle_completed_at.isoformat() + "Z",
+                "execution_ms": execution_ms,
+                "error_message": str(e),
+            }
+            print(f"[Scheduler] {structured}")
+            _safe_insert_cycle_log(b["id"], structured)
+            _safe_insert_cycle_metric({
+                "run_id": run_id,
+                "bot_id": b["id"],
+                "mode": b.get("mode"),
+                "status": "error",
+                "execution_ms": execution_ms,
+                "started_at": cycle_started_at.isoformat() + "Z",
+                "completed_at": cycle_completed_at.isoformat() + "Z",
+                "error_message": str(e),
+            })
+
+    run_completed_at = datetime.utcnow()
+    SCHEDULER_STATE["last_completed_at"] = run_completed_at.isoformat() + "Z"
+    SCHEDULER_STATE["last_duration_ms"] = int((run_completed_at - run_started_at).total_seconds() * 1000)
+    SCHEDULER_STATE["last_status"] = "ok"
+    SCHEDULER_STATE["last_bots_processed"] = bots_processed
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -245,7 +361,7 @@ def create_bot(config: BotConfig, user_id: Optional[UUID] = Query(default=None))
         sb = get_supabase()
         data = {
             "user_id": str(resolved_user_id),
-            "mode": config.mode,
+            "mode": "custom",
             "initial_capital": config.initial_capital,
             "current_capital": config.initial_capital,
             "tickers": config.tickers,
@@ -261,8 +377,9 @@ def create_bot(config: BotConfig, user_id: Optional[UUID] = Query(default=None))
         _raise_api_error(e, "Create bot failed")
 
 @app.post("/bot/{bot_id}/start")
-def start_bot(bot_id: str):
+def start_bot(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
     try:
+        _require_bot_access(bot_id, user_id)
         sb = get_supabase()
         sb.table("bot_instances").update({"status": "running"}).eq("id", bot_id).execute()
         return {"message": f"Bot {bot_id} started"}
@@ -270,8 +387,9 @@ def start_bot(bot_id: str):
         _raise_api_error(e, "Start bot failed")
 
 @app.post("/bot/{bot_id}/stop")
-def stop_bot(bot_id: str):
+def stop_bot(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
     try:
+        _require_bot_access(bot_id, user_id)
         sb = get_supabase()
         sb.table("bot_instances").update({"status": "stopped"}).eq("id", bot_id).execute()
         return {"message": f"Bot {bot_id} stopped"}
@@ -279,8 +397,9 @@ def stop_bot(bot_id: str):
         _raise_api_error(e, "Stop bot failed")
 
 @app.get("/bot/{bot_id}/status")
-def get_bot_status(bot_id: str):
+def get_bot_status(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
     try:
+        _require_bot_access(bot_id, user_id)
         sb = get_supabase()
         bot = sb.table("bot_instances").select("*").eq("id", bot_id).single().execute()
         pos = sb.table("positions").select("*").eq("bot_id", bot_id).execute()
@@ -305,17 +424,36 @@ def get_bot_status(bot_id: str):
         _raise_api_error(e, "Get bot status failed")
 
 @app.get("/bot/{bot_id}/history")
-def get_bot_history(bot_id: str):
+def get_bot_history(
+    bot_id: str,
+    user_id: Optional[UUID] = Query(default=None),
+    limit: int = 100,
+    offset: int = 0,
+    ticker: Optional[str] = Query(default=None),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+):
     try:
+        _require_bot_access(bot_id, user_id)
         sb = get_supabase()
-        trades = sb.table("trades").select("*").eq("bot_id", bot_id).order("exit_time", desc=True).execute()
-        return {"trades": trades.data}
+        safe_limit = max(1, min(limit, 500))
+        safe_offset = max(0, offset)
+        q = sb.table("trades").select("*").eq("bot_id", bot_id)
+        if ticker:
+            q = q.eq("ticker", ticker)
+        if from_date:
+            q = q.gte("exit_time", from_date)
+        if to_date:
+            q = q.lte("exit_time", to_date)
+        trades = q.order("exit_time", desc=True) \
+            .range(safe_offset, safe_offset + safe_limit - 1).execute()
+        return {"trades": trades.data or [], "limit": safe_limit, "offset": safe_offset}
     except Exception as e:
         _raise_api_error(e, "Get bot history failed")
 
 
 @app.get("/bot/{bot_id}/dashboard")
-def get_bot_dashboard(bot_id: str):
+def get_bot_dashboard(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
     """
     Dashboard data for frontend cards:
     - current positions with live unrealized PnL
@@ -323,6 +461,7 @@ def get_bot_dashboard(bot_id: str):
     - cumulative realized PnL
     """
     try:
+        _require_bot_access(bot_id, user_id)
         sb = get_supabase()
         bot = sb.table("bot_instances").select("*").eq("id", bot_id).single().execute()
         positions = sb.table("positions").select("*").eq("bot_id", bot_id).execute()
@@ -364,6 +503,14 @@ def get_bot_dashboard(bot_id: str):
                 "unrealized_pnl_open": round(
                     sum(float(p["unrealized_pnl"]) for p in enriched_positions), 2
                 ),
+                "win_rate_today": round(
+                    (sum(1 for t in today_trades if float(t.get("pnl", 0) or 0) > 0) / len(today_trades) * 100)
+                    if today_trades else 0.0, 2
+                ),
+                "win_rate_total": round(
+                    (sum(1 for t in all_trades if float(t.get("pnl", 0) or 0) > 0) / len(all_trades) * 100)
+                    if all_trades else 0.0, 2
+                ),
             },
         }
     except Exception as e:
@@ -371,22 +518,85 @@ def get_bot_dashboard(bot_id: str):
 
 
 @app.get("/bot/{bot_id}/logs")
-def get_bot_logs(bot_id: str, limit: int = 30):
+def get_bot_logs(
+    bot_id: str,
+    limit: int = 30,
+    offset: int = 0,
+    user_id: Optional[UUID] = Query(default=None),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+):
     """
     Read per-cycle bot logs if bot_cycle_logs table exists.
     """
     try:
+        _require_bot_access(bot_id, user_id)
         sb = get_supabase()
-        rows = sb.table("bot_cycle_logs") \
-            .select("*") \
-            .eq("bot_id", bot_id) \
-            .order("created_at", desc=True) \
-            .limit(max(1, min(limit, 200))) \
+        safe_limit = max(1, min(limit, 200))
+        safe_offset = max(0, offset)
+        q = sb.table("bot_cycle_logs").select("*").eq("bot_id", bot_id)
+        if from_date:
+            q = q.gte("created_at", from_date)
+        if to_date:
+            q = q.lte("created_at", to_date)
+        rows = q.order("created_at", desc=True) \
+            .range(safe_offset, safe_offset + safe_limit - 1) \
             .execute()
-        return {"logs": rows.data or []}
+        return {"logs": rows.data or [], "limit": safe_limit, "offset": safe_offset}
     except Exception as e:
         # Keep this non-fatal for clients that haven't created bot_cycle_logs yet.
         return {"logs": [], "warning": f"bot_cycle_logs unavailable: {e}"}
+
+
+@app.get("/bots")
+def list_bots(user_id: UUID):
+    """
+    Return custom bots for the user + singleton general bot.
+    """
+    try:
+        sb = get_supabase()
+        custom = sb.table("bot_instances") \
+            .select("*") \
+            .eq("user_id", str(user_id)) \
+            .neq("mode", GENERAL_MODE) \
+            .order("created_at", desc=True) \
+            .execute()
+        general = _get_general_bot()
+        return {
+            "general_bot": general,
+            "custom_bots": custom.data or [],
+        }
+    except Exception as e:
+        _raise_api_error(e, "List bots failed")
+
+
+@app.get("/ops/scheduler-health")
+def scheduler_health():
+    """
+    Operational health for scheduler and last run telemetry.
+    """
+    return {
+        "scheduler_running": scheduler.running,
+        "state": SCHEDULER_STATE,
+    }
+
+
+@app.get("/ops/cycle-metrics")
+def cycle_metrics(limit: int = 100, offset: int = 0):
+    """
+    Fetch recent per-bot cycle execution metrics (if bot_cycle_metrics table exists).
+    """
+    try:
+        safe_limit = max(1, min(limit, 500))
+        safe_offset = max(0, offset)
+        rows = get_supabase().table("bot_cycle_metrics") \
+            .select("*") \
+            .order("completed_at", desc=True) \
+            .range(safe_offset, safe_offset + safe_limit - 1) \
+            .execute()
+        return {"rows": rows.data or [], "limit": safe_limit, "offset": safe_offset}
+    except Exception as e:
+        return {"rows": [], "warning": f"bot_cycle_metrics unavailable: {e}"}
 
 
 def _build_dashboard(bot_id: str) -> dict:
@@ -424,6 +634,14 @@ def _build_dashboard(bot_id: str) -> dict:
             "realized_pnl_total": round(realized_total, 2),
             "unrealized_pnl_open": round(
                 sum(float(p["unrealized_pnl"]) for p in enriched_positions), 2
+            ),
+            "win_rate_today": round(
+                (sum(1 for t in today_trades if float(t.get("pnl", 0) or 0) > 0) / len(today_trades) * 100)
+                if today_trades else 0.0, 2
+            ),
+            "win_rate_total": round(
+                (sum(1 for t in all_trades if float(t.get("pnl", 0) or 0) > 0) / len(all_trades) * 100)
+                if all_trades else 0.0, 2
             ),
         },
     }
