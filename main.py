@@ -3,6 +3,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -110,6 +111,18 @@ async def lifespan(app: FastAPI):
 
 # ── API ─────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Trading Bot API", lifespan=lifespan)
+
+# Allow browser apps (Flutter web, local dev frontends) to call this API.
+_cors_origins = os.environ.get("CORS_ORIGINS", "*")
+allow_origins = [o.strip() for o in _cors_origins.split(",")] if _cors_origins else ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.exception_handler(httpx.ConnectError)
