@@ -22,6 +22,7 @@ from engine.config import NIFTY_50_TICKERS, INITIAL_CAPITAL
 scheduler = AsyncIOScheduler()
 GENERAL_BOT_OWNER_ID = "00000000-0000-0000-0000-000000000001"
 GENERAL_MODE = "general"
+GENERAL_MODE_FALLBACK = os.getenv("GENERAL_MODE_FALLBACK", "custom")
 SCHEDULER_STATE = {
     "last_run_id": None,
     "last_started_at": None,
@@ -60,14 +61,26 @@ def _safe_insert_cycle_metric(payload: dict) -> None:
 
 def _get_general_bot() -> Optional[dict]:
     try:
+        # Prefer the reserved owner id so legacy DB constraints (mode=custom only)
+        # can still represent the singleton general bot.
         r = get_supabase().table("bot_instances") \
+            .select("*") \
+            .eq("user_id", GENERAL_BOT_OWNER_ID) \
+            .order("created_at") \
+            .limit(1) \
+            .execute()
+        rows = r.data or []
+        if rows:
+            return rows[0]
+        # Backward compatibility when older rows were keyed by mode.
+        r2 = get_supabase().table("bot_instances") \
             .select("*") \
             .eq("mode", GENERAL_MODE) \
             .order("created_at") \
             .limit(1) \
             .execute()
-        rows = r.data or []
-        return rows[0] if rows else None
+        rows2 = r2.data or []
+        return rows2[0] if rows2 else None
     except Exception:
         return None
 
@@ -85,6 +98,15 @@ def _get_bot_row(bot_id: str) -> Optional[dict]:
         return None
 
 
+def _is_general_bot(bot: Optional[dict]) -> bool:
+    if not bot:
+        return False
+    return (
+        str(bot.get("user_id")) == GENERAL_BOT_OWNER_ID
+        or bot.get("mode") == GENERAL_MODE
+    )
+
+
 def _require_bot_access(bot_id: str, user_id: Optional[UUID]) -> dict:
     """
     Authorize bot access:
@@ -94,7 +116,7 @@ def _require_bot_access(bot_id: str, user_id: Optional[UUID]) -> dict:
     bot = _get_bot_row(bot_id)
     if not bot:
         raise HTTPException(status_code=404, detail="Bot not found.")
-    if bot.get("mode") == GENERAL_MODE:
+    if _is_general_bot(bot):
         return bot
     if user_id is None:
         raise HTTPException(status_code=401, detail="user_id required for custom bot access.")
@@ -108,32 +130,47 @@ def _ensure_general_bot(now_ist: datetime) -> Optional[dict]:
     Ensure singleton general bot exists and is auto-started/stopped by time.
     Trading window: 09:00–16:00 IST.
     """
-    sb = get_supabase()
-    bot = _get_general_bot()
-    should_run = 9 <= now_ist.hour < 16
+    try:
+        sb = get_supabase()
+        bot = _get_general_bot()
+        should_run = 9 <= now_ist.hour < 16
 
-    if bot is None:
-        payload = {
-            "user_id": GENERAL_BOT_OWNER_ID,
-            "mode": GENERAL_MODE,
-            "initial_capital": float(INITIAL_CAPITAL),
-            "current_capital": float(INITIAL_CAPITAL),
-            "tickers": NIFTY_50_TICKERS,
-            "status": "running" if should_run else "stopped",
-        }
-        res = sb.table("bot_instances").insert(payload).execute()
-        rows = res.data or []
-        bot = rows[0] if rows else None
-        if bot:
-            print(f"[General Bot] Created {bot['id']} with status={bot['status']}")
+        if bot is None:
+            payload = {
+                "user_id": GENERAL_BOT_OWNER_ID,
+                "mode": GENERAL_MODE,
+                "initial_capital": float(INITIAL_CAPITAL),
+                "current_capital": float(INITIAL_CAPITAL),
+                "tickers": NIFTY_50_TICKERS,
+                "status": "running" if should_run else "stopped",
+            }
+            try:
+                res = sb.table("bot_instances").insert(payload).execute()
+            except Exception as e:
+                # Handle DB check constraints that don't allow "general" yet.
+                msg = str(e)
+                code = getattr(e, "code", None)
+                if code == "23514" or "bot_instances_mode_check" in msg:
+                    payload["mode"] = GENERAL_MODE_FALLBACK
+                    res = sb.table("bot_instances").insert(payload).execute()
+                else:
+                    raise
+            rows = res.data or []
+            bot = rows[0] if rows else None
+            if bot:
+                print(f"[General Bot] Created {bot['id']} with status={bot['status']}")
+            return bot
+
+        desired = "running" if should_run else "stopped"
+        if bot.get("status") != desired:
+            sb.table("bot_instances").update({"status": desired}).eq("id", bot["id"]).execute()
+            bot["status"] = desired
+            print(f"[General Bot] Auto-set status={desired}")
         return bot
-
-    desired = "running" if should_run else "stopped"
-    if bot.get("status") != desired:
-        sb.table("bot_instances").update({"status": desired}).eq("id", bot["id"]).execute()
-        bot["status"] = desired
-        print(f"[General Bot] Auto-set status={desired}")
-    return bot
+    except Exception as e:
+        # General bot is useful but should never block scheduler for custom bots.
+        print(f"[General Bot] ensure failed (continuing without it): {e}")
+        return None
 
 def _raise_api_error(exc: Exception, context: str) -> None:
     """Map dependency/runtime exceptions to clean API responses."""
@@ -174,9 +211,9 @@ async def scheduled_paper_run():
     SCHEDULER_STATE["last_error"] = None
     SCHEDULER_STATE["last_bots_processed"] = 0
     print(f"[Scheduler] Starting scheduled cycle run_id={run_id}")
+    now_ist = datetime.now(__import__("pytz").timezone("Asia/Kolkata"))
+    _ensure_general_bot(now_ist)
     try:
-        now_ist = datetime.now(__import__("pytz").timezone("Asia/Kolkata"))
-        _ensure_general_bot(now_ist)
         sb = get_supabase()
         # Get all active bots
         res = sb.table("bot_instances").select("*").eq("status", "running").execute()
@@ -184,7 +221,7 @@ async def scheduled_paper_run():
     except Exception as e:
         SCHEDULER_STATE["last_status"] = "error"
         SCHEDULER_STATE["last_error"] = str(e)
-        print(f"[Scheduler] Supabase unreachable, skipping cycle: {e}")
+        print(f"[Scheduler] Failed to fetch running bots, skipping cycle: {e}")
         return
     if not bots:
         print("[Scheduler] No active bots running.")
@@ -596,7 +633,7 @@ def delete_bot(bot_id: str, user_id: UUID):
     """
     try:
         bot = _require_bot_access(bot_id, user_id)
-        if bot.get("mode") == GENERAL_MODE:
+        if _is_general_bot(bot):
             raise HTTPException(status_code=400, detail="General bot cannot be deleted.")
         get_supabase().table("bot_instances").update({"status": "deleted"}).eq("id", bot_id).execute()
         return {"message": f"Bot {bot_id} deleted"}
