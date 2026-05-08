@@ -8,6 +8,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import List
 import time
+import io
+import logging
+from contextlib import redirect_stderr
 
 
 def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
@@ -21,6 +24,8 @@ def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
         import yfinance as yf
     except ImportError:
         raise RuntimeError("yfinance not installed — pip install yfinance")
+    # Avoid noisy provider logs in server output on transient Yahoo failures.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
     try:
         import pytz
@@ -40,14 +45,16 @@ def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
             # Retry with small backoff for transient provider/network failures.
             for attempt in range(3):
                 try:
-                    raw = yf.download(
-                        ticker,
-                        start=start_str,
-                        end=end_str,
-                        interval="5m",
-                        progress=False,
-                        auto_adjust=True,
-                    )
+                    with redirect_stderr(io.StringIO()):
+                        raw = yf.download(
+                            ticker,
+                            start=start_str,
+                            end=end_str,
+                            interval="5m",
+                            progress=False,
+                            auto_adjust=True,
+                            threads=False,
+                        )
                     if not raw.empty:
                         break
                 except Exception:
@@ -100,6 +107,7 @@ def get_latest_prices(tickers: List[str]) -> dict[str, float]:
         import yfinance as yf
     except ImportError:
         return {}
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
     prices = {}
     for ticker in tickers:
@@ -108,7 +116,8 @@ def get_latest_prices(tickers: List[str]) -> dict[str, float]:
             for attempt in range(3):
                 try:
                     t = yf.Ticker(ticker)
-                    hist = t.history(period="1d", interval="5m")
+                    with redirect_stderr(io.StringIO()):
+                        hist = t.history(period="1d", interval="5m")
                     if not hist.empty:
                         break
                 except Exception:

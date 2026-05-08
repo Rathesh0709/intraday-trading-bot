@@ -240,10 +240,47 @@ async def scheduled_paper_run():
     data = fetch_live_candles(list(all_tickers))
     df_5m = data["5m"]
     df_1h = data["1h"]
+    failed_tickers = data.get("failed", [])
     
     if df_5m.empty:
         SCHEDULER_STATE["last_status"] = "data_unavailable"
-        print("[Scheduler] Failed to fetch live data. Skipping.")
+        SCHEDULER_STATE["last_error"] = (
+            f"Live data unavailable from provider. failed_tickers={len(failed_tickers)}"
+        )
+        print(
+            f"[Scheduler] Failed to fetch live data. "
+            f"failed_tickers={len(failed_tickers)} sample={failed_tickers[:8]}"
+        )
+        # Write a runtime log per active bot so frontend users can see the failure.
+        cycle_completed_at = datetime.utcnow()
+        execution_ms = int((cycle_completed_at - run_started_at).total_seconds() * 1000)
+        for b in bots:
+            structured = {
+                "event": "cycle_complete",
+                "bot_id": b["id"],
+                "mode": b.get("mode"),
+                "status": "error",
+                "started_at": run_started_at.isoformat() + "Z",
+                "completed_at": cycle_completed_at.isoformat() + "Z",
+                "execution_ms": execution_ms,
+                "error_message": "Market data provider unavailable",
+                "failed_tickers_count": len(failed_tickers),
+                "failed_tickers_sample": failed_tickers[:10],
+            }
+            _safe_insert_cycle_log(b["id"], structured)
+            _safe_insert_cycle_metric({
+                "run_id": run_id,
+                "bot_id": b["id"],
+                "mode": b.get("mode"),
+                "status": "error",
+                "execution_ms": execution_ms,
+                "started_at": run_started_at.isoformat() + "Z",
+                "completed_at": cycle_completed_at.isoformat() + "Z",
+                "error_message": "Market data provider unavailable",
+            })
+        SCHEDULER_STATE["last_completed_at"] = cycle_completed_at.isoformat() + "Z"
+        SCHEDULER_STATE["last_duration_ms"] = execution_ms
+        SCHEDULER_STATE["last_bots_processed"] = 0
         return
 
     # Run cycle for each bot
