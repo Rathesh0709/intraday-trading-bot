@@ -1072,12 +1072,20 @@ def get_general_bot_summary(limit: int = 30):
         if not bot:
             return {"message": "General bot not initialized yet.", "bot": None, "logs": []}
         dashboard = _build_dashboard(bot["id"])
-        logs = get_bot_logs(bot["id"], limit=limit)
+        safe_limit = max(1, min(limit, 200))
+        rows = get_supabase().table("bot_cycle_logs") \
+            .select("*") \
+            .eq("bot_id", bot["id"]) \
+            .order("created_at", desc=True) \
+            .range(0, safe_limit - 1) \
+            .execute()
         return {
             "bot_id": bot["id"],
             "dashboard": dashboard,
-            "logs": logs.get("logs", []),
-            "logs_warning": logs.get("warning"),
+            "logs": rows.data or [],
+            "logs_warning": None,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "Get general bot summary failed")
