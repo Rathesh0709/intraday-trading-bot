@@ -1,7 +1,8 @@
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, date, timedelta
+from functools import lru_cache
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,170 @@ from engine.signals import models_ready
 from engine.data import fetch_live_candles, get_latest_prices
 from engine.paper import run_cycle
 from engine.config import NIFTY_50_TICKERS, INITIAL_CAPITAL
+
+# ── NSE Market Calendar ─────────────────────────────────────────────────────
+
+# Hardcoded NSE trading holidays for 2025-2026 (updated annually)
+# Source: https://www.nseindia.com/products-services/equity-market-holidays
+_NSE_HOLIDAYS_HARDCODED: set[str] = {
+    # 2025
+    "2025-01-26",  # Republic Day
+    "2025-02-26",  # Mahashivratri
+    "2025-03-14",  # Holi
+    "2025-03-31",  # Id-Ul-Fitr (Ramzan Id)
+    "2025-04-10",  # Shri Ram Navami
+    "2025-04-14",  # Dr. Baba Saheb Ambedkar Jayanti & Good Friday
+    "2025-04-18",  # Good Friday
+    "2025-05-01",  # Maharashtra Day
+    "2025-08-15",  # Independence Day
+    "2025-08-27",  # Ganesh Chaturthi
+    "2025-10-02",  # Gandhi Jayanti
+    "2025-10-02",  # Dussehra
+    "2025-10-20",  # Diwali Laxmi Puja
+    "2025-10-21",  # Diwali Balipratipada
+    "2025-11-05",  # Gurunanak Jayanti
+    "2025-12-25",  # Christmas
+    # 2026
+    "2026-01-26",  # Republic Day
+    "2026-03-20",  # Holi
+    "2026-04-03",  # Good Friday
+    "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+    "2026-05-01",  # Maharashtra Day / Labour Day
+    "2026-08-15",  # Independence Day
+    "2026-10-02",  # Gandhi Jayanti
+    "2026-11-14",  # Diwali
+    "2026-12-25",  # Christmas
+}
+
+# Cache fetched holidays for 1 hour to avoid hammering the API
+_fetched_holidays_cache: dict = {"data": None, "fetched_at": None}
+
+
+def _fetch_nse_holidays_from_api() -> set[str]:
+    """Try to fetch current year NSE holidays from a free public API."""
+    try:
+        import requests
+        year = date.today().year
+        # NSE India calendar API (public endpoint)
+        url = f"https://www.nseindia.com/api/holiday-master?type=trading"
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            holidays = set()
+            for category in data.values():
+                for entry in category:
+                    d_str = entry.get("tradingDate", "")
+                    try:
+                        d_obj = datetime.strptime(d_str, "%d-%b-%Y").date()
+                        holidays.add(d_obj.isoformat())
+                    except Exception:
+                        pass
+            return holidays
+    except Exception:
+        pass
+    return set()
+
+
+def get_nse_holidays() -> set[str]:
+    """Return NSE holiday dates as ISO strings. Cached for 1 hour."""
+    cache = _fetched_holidays_cache
+    now = datetime.utcnow()
+    if cache["data"] is None or (
+        cache["fetched_at"] and (now - cache["fetched_at"]).total_seconds() > 3600
+    ):
+        live = _fetch_nse_holidays_from_api()
+        cache["data"] = live if live else _NSE_HOLIDAYS_HARDCODED
+        cache["fetched_at"] = now
+    return cache["data"]
+
+
+def get_market_status(now_ist: datetime) -> dict:
+    """
+    Returns a dict with:
+      - is_open (bool)
+      - status_code (str): 'open' | 'weekend' | 'pre_market' | 'post_market' | 'holiday'
+      - message (str): Human-readable message for the UI
+      - next_open (str | None): ISO datetime when market opens next
+    """
+    dow = now_ist.weekday()  # 0=Mon … 6=Sun
+    today_str = now_ist.date().isoformat()
+    holidays = get_nse_holidays()
+
+    # ── Weekend ─────────────────────────────────────────────────────
+    if dow == 5:  # Saturday
+        return {
+            "is_open": False,
+            "status_code": "weekend",
+            "message": "Markets are closed on weekends. Come back on Monday at 9:15 AM IST!",
+            "next_open": _next_monday_open(now_ist),
+        }
+    if dow == 6:  # Sunday
+        return {
+            "is_open": False,
+            "status_code": "weekend",
+            "message": "It's Sunday — markets are closed. See you Monday at 9:15 AM IST!",
+            "next_open": _next_monday_open(now_ist),
+        }
+
+    # ── Public Holiday ────────────────────────────────────────────
+    if today_str in holidays:
+        # Find next non-holiday weekday
+        return {
+            "is_open": False,
+            "status_code": "holiday",
+            "message": f"NSE is closed today for a public holiday ({today_str}). Markets reopen on the next trading day at 9:15 AM IST.",
+            "next_open": _next_trading_open(now_ist, holidays),
+        }
+
+    # ── Pre-market ────────────────────────────────────────────────
+    h, m = now_ist.hour, now_ist.minute
+    if (h < 9) or (h == 9 and m < 15):
+        return {
+            "is_open": False,
+            "status_code": "pre_market",
+            "message": f"Market opens at 9:15 AM IST today. Current IST time: {now_ist.strftime('%I:%M %p')}.",
+            "next_open": now_ist.replace(hour=9, minute=15, second=0, microsecond=0).isoformat(),
+        }
+
+    # ── Post-market ───────────────────────────────────────────────
+    if h >= 16 or (h == 15 and m > 30):
+        return {
+            "is_open": False,
+            "status_code": "post_market",
+            "message": f"Market closed for the day at 3:30 PM IST. Come back tomorrow at 9:15 AM IST!",
+            "next_open": _next_trading_open(now_ist + timedelta(days=1), holidays),
+        }
+
+    # ── Market is open ────────────────────────────────────────────
+    return {
+        "is_open": True,
+        "status_code": "open",
+        "message": "Market is open and the bot is trading!",
+        "next_open": None,
+    }
+
+
+def _next_monday_open(now_ist: datetime) -> str:
+    days_until_monday = (7 - now_ist.weekday()) % 7 or 7
+    next_monday = (now_ist + timedelta(days=days_until_monday)).replace(
+        hour=9, minute=15, second=0, microsecond=0
+    )
+    return next_monday.isoformat()
+
+
+def _next_trading_open(from_dt: datetime, holidays: set[str]) -> str:
+    """Find next weekday that is not a holiday, returns ISO string at 9:15."""
+    d = from_dt.date()
+    for _ in range(14):  # max 2 weeks look-ahead
+        if d.weekday() < 5 and d.isoformat() not in holidays:
+            return datetime(
+                d.year, d.month, d.day, 9, 15, 0,
+                tzinfo=from_dt.tzinfo
+            ).isoformat()
+        d += timedelta(days=1)
+    return (from_dt + timedelta(days=3)).isoformat()  # fallback
+
 
 # ── Scheduler ───────────────────────────────────────────────────────────────
 scheduler = AsyncIOScheduler()
@@ -201,6 +366,16 @@ async def scheduled_paper_run():
     """Run paper trading cycle for all active bots."""
     if not models_ready():
         print("[Scheduler] Models not ready, skipping cycle.")
+        return
+
+    # ── Market Calendar Guard ─────────────────────────────────────
+    import pytz
+    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    mkt = get_market_status(now_ist)
+    if not mkt["is_open"]:
+        print(f"[Scheduler] Skipping cycle — {mkt['status_code'].upper()}: {mkt['message']}")
+        SCHEDULER_STATE["last_status"] = mkt["status_code"]
+        SCHEDULER_STATE["last_error"] = mkt["message"]
         return
 
     run_id = str(uuid.uuid4())
@@ -684,10 +859,41 @@ def delete_bot(bot_id: str, user_id: UUID):
 def scheduler_health():
     """
     Operational health for scheduler and last run telemetry.
+    Includes current market status so frontend can show contextual messages.
     """
+    import pytz
+    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    mkt = get_market_status(now_ist)
     return {
         "scheduler_running": scheduler.running,
         "state": SCHEDULER_STATE,
+        "market_status": mkt,
+        "ist_time": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+    }
+
+
+@app.get("/ops/market-status")
+def market_status_endpoint():
+    """
+    Returns the current NSE market status with a user-friendly message.
+
+    status_code values:
+      - "open"         → market is live, bot is trading
+      - "pre_market"   → weekday but before 9:15 AM IST
+      - "post_market"  → weekday but after 3:30 PM IST
+      - "weekend"      → Saturday or Sunday
+      - "holiday"      → NSE public holiday
+
+    The frontend should display `message` to the user and optionally
+    show a countdown using `next_open`.
+    """
+    import pytz
+    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    mkt = get_market_status(now_ist)
+    return {
+        **mkt,
+        "ist_time": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "holiday_list_source": "NSE India (hardcoded 2025–2026, live API when reachable)",
     }
 
 
