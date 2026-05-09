@@ -3,7 +3,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
 from functools import lru_cache
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -197,6 +197,7 @@ SCHEDULER_STATE = {
     "last_error": None,
     "last_bots_processed": 0,
 }
+SCHEDULER_CYCLE_IN_PROGRESS = False
 
 
 def _safe_insert_cycle_log(bot_id: str, payload: dict) -> None:
@@ -290,6 +291,39 @@ def _require_bot_access(bot_id: str, user_id: Optional[UUID]) -> dict:
     return bot
 
 
+def _get_current_user_id(authorization: Optional[str] = Header(default=None, alias="Authorization")) -> UUID:
+    """
+    Resolve authenticated user from Supabase JWT.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header.")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header format.")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token.")
+    try:
+        auth_res = get_supabase().auth.get_user(token)
+        user_obj = getattr(auth_res, "user", None)
+        user_id = getattr(user_obj, "id", None)
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid or expired auth token.")
+        return UUID(str(user_id))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Auth verification failed: {e}")
+
+
+def _resolve_effective_user_id(auth_user_id: UUID, requested_user_id: Optional[UUID]) -> UUID:
+    """
+    Enforce that caller can only act as themselves.
+    """
+    if requested_user_id and str(requested_user_id) != str(auth_user_id):
+        raise HTTPException(status_code=403, detail="Token user does not match requested user_id.")
+    return auth_user_id
+
+
 def _ensure_general_bot(now_ist: datetime) -> Optional[dict]:
     """
     Ensure singleton general bot exists and is auto-started/stopped by time.
@@ -298,7 +332,7 @@ def _ensure_general_bot(now_ist: datetime) -> Optional[dict]:
     try:
         sb = get_supabase()
         bot = _get_general_bot()
-        should_run = 9 <= now_ist.hour < 16
+        should_run = bool(get_market_status(now_ist).get("is_open"))
 
         if bot is None:
             payload = {
@@ -364,6 +398,13 @@ def _raise_api_error(exc: Exception, context: str) -> None:
 
 async def scheduled_paper_run():
     """Run paper trading cycle for all active bots."""
+    global SCHEDULER_CYCLE_IN_PROGRESS
+    if SCHEDULER_CYCLE_IN_PROGRESS:
+        SCHEDULER_STATE["last_status"] = "overlap_skipped"
+        SCHEDULER_STATE["last_error"] = "Previous cycle is still in progress."
+        print("[Scheduler] Previous cycle still running, skipping overlap.")
+        return
+
     if not models_ready():
         print("[Scheduler] Models not ready, skipping cycle.")
         return
@@ -378,148 +419,152 @@ async def scheduled_paper_run():
         SCHEDULER_STATE["last_error"] = mkt["message"]
         return
 
-    run_id = str(uuid.uuid4())
-    run_started_at = datetime.utcnow()
-    SCHEDULER_STATE["last_run_id"] = run_id
-    SCHEDULER_STATE["last_started_at"] = run_started_at.isoformat() + "Z"
-    SCHEDULER_STATE["last_status"] = "running"
-    SCHEDULER_STATE["last_error"] = None
-    SCHEDULER_STATE["last_bots_processed"] = 0
-    print(f"[Scheduler] Starting scheduled cycle run_id={run_id}")
-    now_ist = datetime.now(__import__("pytz").timezone("Asia/Kolkata"))
-    _ensure_general_bot(now_ist)
+    SCHEDULER_CYCLE_IN_PROGRESS = True
     try:
-        sb = get_supabase()
-        # Get all active bots
-        res = sb.table("bot_instances").select("*").eq("status", "running").execute()
-        bots = res.data
-    except Exception as e:
-        SCHEDULER_STATE["last_status"] = "error"
-        SCHEDULER_STATE["last_error"] = str(e)
-        print(f"[Scheduler] Failed to fetch running bots, skipping cycle: {e}")
-        return
-    if not bots:
-        print("[Scheduler] No active bots running.")
-        return
-
-    # Collect all unique tickers needed across all bots
-    all_tickers = set()
-    for b in bots:
-        if b.get("tickers"):
-            all_tickers.update(b["tickers"])
-    
-    if not all_tickers:
-        return
-        
-    # Fetch data once for everyone
-    data = fetch_live_candles(list(all_tickers))
-    df_5m = data["5m"]
-    df_1h = data["1h"]
-    failed_tickers = data.get("failed", [])
-    
-    if df_5m.empty:
-        SCHEDULER_STATE["last_status"] = "data_unavailable"
-        SCHEDULER_STATE["last_error"] = (
-            f"Live data unavailable from provider. failed_tickers={len(failed_tickers)}"
-        )
-        print(
-            f"[Scheduler] Failed to fetch live data. "
-            f"failed_tickers={len(failed_tickers)} sample={failed_tickers[:8]}"
-        )
-        # Write a runtime log per active bot so frontend users can see the failure.
-        cycle_completed_at = datetime.utcnow()
-        execution_ms = int((cycle_completed_at - run_started_at).total_seconds() * 1000)
-        for b in bots:
-            structured = {
-                "event": "cycle_complete",
-                "bot_id": b["id"],
-                "mode": b.get("mode"),
-                "status": "error",
-                "started_at": run_started_at.isoformat() + "Z",
-                "completed_at": cycle_completed_at.isoformat() + "Z",
-                "execution_ms": execution_ms,
-                "error_message": "Market data provider unavailable",
-                "failed_tickers_count": len(failed_tickers),
-                "failed_tickers_sample": failed_tickers[:10],
-            }
-            _safe_insert_cycle_log(b["id"], structured)
-            _safe_insert_cycle_metric({
-                "run_id": run_id,
-                "bot_id": b["id"],
-                "mode": b.get("mode"),
-                "status": "error",
-                "execution_ms": execution_ms,
-                "started_at": run_started_at.isoformat() + "Z",
-                "completed_at": cycle_completed_at.isoformat() + "Z",
-                "error_message": "Market data provider unavailable",
-            })
-        SCHEDULER_STATE["last_completed_at"] = cycle_completed_at.isoformat() + "Z"
-        SCHEDULER_STATE["last_duration_ms"] = execution_ms
+        run_id = str(uuid.uuid4())
+        run_started_at = datetime.utcnow()
+        SCHEDULER_STATE["last_run_id"] = run_id
+        SCHEDULER_STATE["last_started_at"] = run_started_at.isoformat() + "Z"
+        SCHEDULER_STATE["last_status"] = "running"
+        SCHEDULER_STATE["last_error"] = None
         SCHEDULER_STATE["last_bots_processed"] = 0
-        return
-
-    # Run cycle for each bot
-    bots_processed = 0
-    for b in bots:
-        cycle_started_at = datetime.utcnow()
+        print(f"[Scheduler] Starting scheduled cycle run_id={run_id}")
+        now_ist = datetime.now(__import__("pytz").timezone("Asia/Kolkata"))
+        _ensure_general_bot(now_ist)
         try:
-            log = run_cycle(b["id"], df_5m, df_1h)
-            bots_processed += 1
-            cycle_completed_at = datetime.utcnow()
-            execution_ms = int((cycle_completed_at - cycle_started_at).total_seconds() * 1000)
-            structured = {
-                "event": "cycle_complete",
-                "bot_id": b["id"],
-                "mode": b.get("mode"),
-                "status": "ok",
-                "started_at": cycle_started_at.isoformat() + "Z",
-                "completed_at": cycle_completed_at.isoformat() + "Z",
-                "execution_ms": execution_ms,
-                "cycle": log,
-            }
-            print(f"[Scheduler] {structured}")
-            _safe_insert_cycle_log(b["id"], structured)
-            _safe_insert_cycle_metric({
-                "run_id": run_id,
-                "bot_id": b["id"],
-                "mode": b.get("mode"),
-                "status": "ok",
-                "execution_ms": execution_ms,
-                "started_at": cycle_started_at.isoformat() + "Z",
-                "completed_at": cycle_completed_at.isoformat() + "Z",
-                "cycle_pnl": (log or {}).get("cycle_pnl", 0.0),
-            })
+            sb = get_supabase()
+            # Get all active bots
+            res = sb.table("bot_instances").select("*").eq("status", "running").execute()
+            bots = res.data
         except Exception as e:
-            cycle_completed_at = datetime.utcnow()
-            execution_ms = int((cycle_completed_at - cycle_started_at).total_seconds() * 1000)
-            structured = {
-                "event": "cycle_complete",
-                "bot_id": b["id"],
-                "mode": b.get("mode"),
-                "status": "error",
-                "started_at": cycle_started_at.isoformat() + "Z",
-                "completed_at": cycle_completed_at.isoformat() + "Z",
-                "execution_ms": execution_ms,
-                "error_message": str(e),
-            }
-            print(f"[Scheduler] {structured}")
-            _safe_insert_cycle_log(b["id"], structured)
-            _safe_insert_cycle_metric({
-                "run_id": run_id,
-                "bot_id": b["id"],
-                "mode": b.get("mode"),
-                "status": "error",
-                "execution_ms": execution_ms,
-                "started_at": cycle_started_at.isoformat() + "Z",
-                "completed_at": cycle_completed_at.isoformat() + "Z",
-                "error_message": str(e),
-            })
+            SCHEDULER_STATE["last_status"] = "error"
+            SCHEDULER_STATE["last_error"] = str(e)
+            print(f"[Scheduler] Failed to fetch running bots, skipping cycle: {e}")
+            return
+        if not bots:
+            print("[Scheduler] No active bots running.")
+            return
 
-    run_completed_at = datetime.utcnow()
-    SCHEDULER_STATE["last_completed_at"] = run_completed_at.isoformat() + "Z"
-    SCHEDULER_STATE["last_duration_ms"] = int((run_completed_at - run_started_at).total_seconds() * 1000)
-    SCHEDULER_STATE["last_status"] = "ok"
-    SCHEDULER_STATE["last_bots_processed"] = bots_processed
+        # Collect all unique tickers needed across all bots
+        all_tickers = set()
+        for b in bots:
+            if b.get("tickers"):
+                all_tickers.update(b["tickers"])
+
+        if not all_tickers:
+            return
+
+        # Fetch data once for everyone
+        data = fetch_live_candles(list(all_tickers))
+        df_5m = data["5m"]
+        df_1h = data["1h"]
+        failed_tickers = data.get("failed", [])
+
+        if df_5m.empty:
+            SCHEDULER_STATE["last_status"] = "data_unavailable"
+            SCHEDULER_STATE["last_error"] = (
+                f"Live data unavailable from provider. failed_tickers={len(failed_tickers)}"
+            )
+            print(
+                f"[Scheduler] Failed to fetch live data. "
+                f"failed_tickers={len(failed_tickers)} sample={failed_tickers[:8]}"
+            )
+            # Write a runtime log per active bot so frontend users can see the failure.
+            cycle_completed_at = datetime.utcnow()
+            execution_ms = int((cycle_completed_at - run_started_at).total_seconds() * 1000)
+            for b in bots:
+                structured = {
+                    "event": "cycle_complete",
+                    "bot_id": b["id"],
+                    "mode": b.get("mode"),
+                    "status": "error",
+                    "started_at": run_started_at.isoformat() + "Z",
+                    "completed_at": cycle_completed_at.isoformat() + "Z",
+                    "execution_ms": execution_ms,
+                    "error_message": "Market data provider unavailable",
+                    "failed_tickers_count": len(failed_tickers),
+                    "failed_tickers_sample": failed_tickers[:10],
+                }
+                _safe_insert_cycle_log(b["id"], structured)
+                _safe_insert_cycle_metric({
+                    "run_id": run_id,
+                    "bot_id": b["id"],
+                    "mode": b.get("mode"),
+                    "status": "error",
+                    "execution_ms": execution_ms,
+                    "started_at": run_started_at.isoformat() + "Z",
+                    "completed_at": cycle_completed_at.isoformat() + "Z",
+                    "error_message": "Market data provider unavailable",
+                })
+            SCHEDULER_STATE["last_completed_at"] = cycle_completed_at.isoformat() + "Z"
+            SCHEDULER_STATE["last_duration_ms"] = execution_ms
+            SCHEDULER_STATE["last_bots_processed"] = 0
+            return
+
+        # Run cycle for each bot
+        bots_processed = 0
+        for b in bots:
+            cycle_started_at = datetime.utcnow()
+            try:
+                log = run_cycle(b["id"], df_5m, df_1h)
+                bots_processed += 1
+                cycle_completed_at = datetime.utcnow()
+                execution_ms = int((cycle_completed_at - cycle_started_at).total_seconds() * 1000)
+                structured = {
+                    "event": "cycle_complete",
+                    "bot_id": b["id"],
+                    "mode": b.get("mode"),
+                    "status": "ok",
+                    "started_at": cycle_started_at.isoformat() + "Z",
+                    "completed_at": cycle_completed_at.isoformat() + "Z",
+                    "execution_ms": execution_ms,
+                    "cycle": log,
+                }
+                print(f"[Scheduler] {structured}")
+                _safe_insert_cycle_log(b["id"], structured)
+                _safe_insert_cycle_metric({
+                    "run_id": run_id,
+                    "bot_id": b["id"],
+                    "mode": b.get("mode"),
+                    "status": "ok",
+                    "execution_ms": execution_ms,
+                    "started_at": cycle_started_at.isoformat() + "Z",
+                    "completed_at": cycle_completed_at.isoformat() + "Z",
+                    "cycle_pnl": (log or {}).get("cycle_pnl", 0.0),
+                })
+            except Exception as e:
+                cycle_completed_at = datetime.utcnow()
+                execution_ms = int((cycle_completed_at - cycle_started_at).total_seconds() * 1000)
+                structured = {
+                    "event": "cycle_complete",
+                    "bot_id": b["id"],
+                    "mode": b.get("mode"),
+                    "status": "error",
+                    "started_at": cycle_started_at.isoformat() + "Z",
+                    "completed_at": cycle_completed_at.isoformat() + "Z",
+                    "execution_ms": execution_ms,
+                    "error_message": str(e),
+                }
+                print(f"[Scheduler] {structured}")
+                _safe_insert_cycle_log(b["id"], structured)
+                _safe_insert_cycle_metric({
+                    "run_id": run_id,
+                    "bot_id": b["id"],
+                    "mode": b.get("mode"),
+                    "status": "error",
+                    "execution_ms": execution_ms,
+                    "started_at": cycle_started_at.isoformat() + "Z",
+                    "completed_at": cycle_completed_at.isoformat() + "Z",
+                    "error_message": str(e),
+                })
+
+        run_completed_at = datetime.utcnow()
+        SCHEDULER_STATE["last_completed_at"] = run_completed_at.isoformat() + "Z"
+        SCHEDULER_STATE["last_duration_ms"] = int((run_completed_at - run_started_at).total_seconds() * 1000)
+        SCHEDULER_STATE["last_status"] = "ok"
+        SCHEDULER_STATE["last_bots_processed"] = bots_processed
+    finally:
+        SCHEDULER_CYCLE_IN_PROGRESS = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -591,6 +636,8 @@ def health_check():
 @app.get("/debug")
 def debug_env():
     """Check that environment variables are set correctly (safe — only shows partial values)."""
+    if os.environ.get("ENABLE_DEBUG_ENDPOINT", "false").lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=404, detail="Not Found")
     url = os.environ.get("SUPABASE_URL", "NOT SET")
     key = os.environ.get("SUPABASE_SERVICE_KEY", "NOT SET")
     return {
@@ -601,12 +648,14 @@ def debug_env():
     }
 
 @app.post("/bot/create")
-def create_bot(config: BotConfig, user_id: Optional[UUID] = Query(default=None)):
+def create_bot(
+    config: BotConfig,
+    user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
+):
     """Create a new bot instance for a user."""
     try:
-        resolved_user_id = user_id or config.user_id
-        if not resolved_user_id:
-            raise HTTPException(status_code=422, detail="user_id is required in query or body.")
+        resolved_user_id = _resolve_effective_user_id(auth_user_id, user_id or config.user_id)
         sb = get_supabase()
         data = {
             "user_id": str(resolved_user_id),
@@ -626,29 +675,48 @@ def create_bot(config: BotConfig, user_id: Optional[UUID] = Query(default=None))
         _raise_api_error(e, "Create bot failed")
 
 @app.post("/bot/{bot_id}/start")
-def start_bot(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
+def start_bot(
+    bot_id: str,
+    user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
+):
     try:
-        _require_bot_access(bot_id, user_id)
+        effective_user = _resolve_effective_user_id(auth_user_id, user_id)
+        _require_bot_access(bot_id, effective_user)
         sb = get_supabase()
         sb.table("bot_instances").update({"status": "running"}).eq("id", bot_id).execute()
         return {"message": f"Bot {bot_id} started"}
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "Start bot failed")
 
 @app.post("/bot/{bot_id}/stop")
-def stop_bot(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
+def stop_bot(
+    bot_id: str,
+    user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
+):
     try:
-        _require_bot_access(bot_id, user_id)
+        effective_user = _resolve_effective_user_id(auth_user_id, user_id)
+        _require_bot_access(bot_id, effective_user)
         sb = get_supabase()
         sb.table("bot_instances").update({"status": "stopped"}).eq("id", bot_id).execute()
         return {"message": f"Bot {bot_id} stopped"}
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "Stop bot failed")
 
 @app.get("/bot/{bot_id}/status")
-def get_bot_status(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
+def get_bot_status(
+    bot_id: str,
+    user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
+):
     try:
-        _require_bot_access(bot_id, user_id)
+        effective_user = _resolve_effective_user_id(auth_user_id, user_id)
+        _require_bot_access(bot_id, effective_user)
         sb = get_supabase()
         bot = sb.table("bot_instances").select("*").eq("id", bot_id).single().execute()
         pos = sb.table("positions").select("*").eq("bot_id", bot_id).execute()
@@ -669,6 +737,8 @@ def get_bot_status(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
             "bot": bot.data,
             "positions": enriched_pos
         }
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "Get bot status failed")
 
@@ -676,6 +746,7 @@ def get_bot_status(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
 def get_bot_history(
     bot_id: str,
     user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
     limit: int = 100,
     offset: int = 0,
     ticker: Optional[str] = Query(default=None),
@@ -683,7 +754,8 @@ def get_bot_history(
     to_date: Optional[str] = Query(default=None),
 ):
     try:
-        _require_bot_access(bot_id, user_id)
+        effective_user = _resolve_effective_user_id(auth_user_id, user_id)
+        _require_bot_access(bot_id, effective_user)
         sb = get_supabase()
         safe_limit = max(1, min(limit, 500))
         safe_offset = max(0, offset)
@@ -697,12 +769,18 @@ def get_bot_history(
         trades = q.order("exit_time", desc=True) \
             .range(safe_offset, safe_offset + safe_limit - 1).execute()
         return {"trades": trades.data or [], "limit": safe_limit, "offset": safe_offset}
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "Get bot history failed")
 
 
 @app.get("/bot/{bot_id}/dashboard")
-def get_bot_dashboard(bot_id: str, user_id: Optional[UUID] = Query(default=None)):
+def get_bot_dashboard(
+    bot_id: str,
+    user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
+):
     """
     Dashboard data for frontend cards:
     - current positions with live unrealized PnL
@@ -710,7 +788,8 @@ def get_bot_dashboard(bot_id: str, user_id: Optional[UUID] = Query(default=None)
     - cumulative realized PnL
     """
     try:
-        _require_bot_access(bot_id, user_id)
+        effective_user = _resolve_effective_user_id(auth_user_id, user_id)
+        _require_bot_access(bot_id, effective_user)
         sb = get_supabase()
         bot = sb.table("bot_instances").select("*").eq("id", bot_id).single().execute()
         positions = sb.table("positions").select("*").eq("bot_id", bot_id).execute()
@@ -762,6 +841,8 @@ def get_bot_dashboard(bot_id: str, user_id: Optional[UUID] = Query(default=None)
                 ),
             },
         }
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "Get bot dashboard failed")
 
@@ -772,6 +853,7 @@ def get_bot_logs(
     limit: int = 30,
     offset: int = 0,
     user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
     from_date: Optional[str] = Query(default=None),
     to_date: Optional[str] = Query(default=None),
 ):
@@ -779,7 +861,8 @@ def get_bot_logs(
     Read per-cycle bot logs if bot_cycle_logs table exists.
     """
     try:
-        _require_bot_access(bot_id, user_id)
+        effective_user = _resolve_effective_user_id(auth_user_id, user_id)
+        _require_bot_access(bot_id, effective_user)
         sb = get_supabase()
         safe_limit = max(1, min(limit, 200))
         safe_offset = max(0, offset)
@@ -792,21 +875,27 @@ def get_bot_logs(
             .range(safe_offset, safe_offset + safe_limit - 1) \
             .execute()
         return {"logs": rows.data or [], "limit": safe_limit, "offset": safe_offset}
+    except HTTPException:
+        raise
     except Exception as e:
-        # Keep this non-fatal for clients that haven't created bot_cycle_logs yet.
-        return {"logs": [], "warning": f"bot_cycle_logs unavailable: {e}"}
+        # Keep this non-fatal only when the logs table is missing.
+        msg = str(e).lower()
+        if "bot_cycle_logs" in msg and "does not exist" in msg:
+            return {"logs": [], "warning": f"bot_cycle_logs unavailable: {e}"}
+        _raise_api_error(e, "Get bot logs failed")
 
 
 @app.get("/bots")
-def list_bots(user_id: UUID):
+def list_bots(user_id: Optional[UUID] = Query(default=None), auth_user_id: UUID = Depends(_get_current_user_id)):
     """
     Return custom bots for the user + singleton general bot.
     """
     try:
+        resolved_user_id = _resolve_effective_user_id(auth_user_id, user_id)
         sb = get_supabase()
         custom = sb.table("bot_instances") \
             .select("*") \
-            .eq("user_id", str(user_id)) \
+            .eq("user_id", str(resolved_user_id)) \
             .neq("mode", GENERAL_MODE) \
             .neq("status", "deleted") \
             .order("created_at", desc=True) \
@@ -816,35 +905,45 @@ def list_bots(user_id: UUID):
             "general_bot": general,
             "custom_bots": custom.data or [],
         }
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "List bots failed")
 
 
 @app.get("/bots/history")
-def list_bots_history(user_id: UUID):
+def list_bots_history(user_id: Optional[UUID] = Query(default=None), auth_user_id: UUID = Depends(_get_current_user_id)):
     """
     Return all custom bots for the user including deleted/inactive ones.
     """
     try:
+        resolved_user_id = _resolve_effective_user_id(auth_user_id, user_id)
         rows = get_supabase().table("bot_instances") \
             .select("*") \
-            .eq("user_id", str(user_id)) \
+            .eq("user_id", str(resolved_user_id)) \
             .neq("mode", GENERAL_MODE) \
             .order("created_at", desc=True) \
             .execute()
         return {"custom_bots_history": rows.data or []}
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_api_error(e, "List bots history failed")
 
 
 @app.delete("/bot/{bot_id}")
-def delete_bot(bot_id: str, user_id: UUID):
+def delete_bot(
+    bot_id: str,
+    user_id: Optional[UUID] = Query(default=None),
+    auth_user_id: UUID = Depends(_get_current_user_id),
+):
     """
     Soft delete custom bot by marking status=deleted.
     General bot cannot be deleted.
     """
     try:
-        bot = _require_bot_access(bot_id, user_id)
+        effective_user = _resolve_effective_user_id(auth_user_id, user_id)
+        bot = _require_bot_access(bot_id, effective_user)
         if _is_general_bot(bot):
             raise HTTPException(status_code=400, detail="General bot cannot be deleted.")
         get_supabase().table("bot_instances").update({"status": "deleted"}).eq("id", bot_id).execute()

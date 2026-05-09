@@ -17,7 +17,7 @@ from engine.config import (
     INITIAL_CAPITAL, MIN_SHARES, MAX_OPEN_POSITIONS, RISK_PER_TRADE,
     SL_PCT, TP_PCT, ATR_SL_MULT, ATR_TP_MULT, MAX_SL_PCT,
     USE_TRAILING_STOP, TRAILING_ATR_MULT, ROUND_TRIP_COST,
-    MAX_DAILY_LOSS_PCT, EXIT_HOUR_IST, EXIT_MIN_IST,
+    MAX_DAILY_LOSS_PCT, EXIT_HOUR_IST, EXIT_MIN_IST, MAX_PORTFOLIO_EXPOSURE,
     ENTRY_CUTOFF_HOUR, ENTRY_CUTOFF_MIN,
 )
 from engine.signals import generate_signals
@@ -70,6 +70,47 @@ def _get_today_trades(bot_id: str, today_str: str) -> list[dict]:
     return r.data or []
 
 
+def _close_position_atomic(
+    bot_id: str,
+    pos: dict,
+    exit_price: float,
+    reason: str,
+    now_iso: str,
+    pnl: float,
+) -> bool:
+    """
+    Prefer DB-side atomic close via RPC.
+    Falls back to client-side multi-step write for backward compatibility.
+    """
+    sb = get_supabase()
+    try:
+        sb.rpc("close_position_atomic", {
+            "p_bot_id": bot_id,
+            "p_ticker": pos["ticker"],
+            "p_entry_price": float(pos["entry_price"]),
+            "p_exit_price": float(exit_price),
+            "p_qty": int(pos["qty"]),
+            "p_direction": int(pos["direction"]),
+            "p_reason": str(reason),
+            "p_exit_time": now_iso,
+            "p_pnl": float(round(pnl, 2)),
+        }).execute()
+        return True
+    except Exception:
+        _insert_trade(bot_id, {
+            "ticker": pos["ticker"],
+            "direction": "BUY" if pos["direction"] == 1 else "SELL",
+            "entry_price": pos["entry_price"],
+            "exit_price": round(exit_price, 2),
+            "qty": pos["qty"],
+            "pnl": round(pnl, 2),
+            "reason": reason,
+            "exit_time": now_iso,
+        })
+        _delete_position(bot_id, pos["ticker"])
+        return False
+
+
 # ── Main cycle ────────────────────────────────────────────────────────────────
 
 def run_cycle(bot_id: str, df_5m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
@@ -113,13 +154,14 @@ def run_cycle(bot_id: str, df_5m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
             cost = pos["entry_price"] * pos["qty"] * ROUND_TRIP_COST
             pnl  = ((cur_price - pos["entry_price"]) * pos["qty"] * pos["direction"]) - cost
             capital += pnl
-            _insert_trade(bot_id, {
-                "ticker": ticker, "direction": "BUY" if pos["direction"] == 1 else "SELL",
-                "entry_price": pos["entry_price"], "exit_price": round(cur_price, 2),
-                "qty": pos["qty"], "pnl": round(pnl, 2), "reason": "EOD",
-                "exit_time": now_ist.isoformat(),
-            })
-            _delete_position(bot_id, ticker)
+            _close_position_atomic(
+                bot_id=bot_id,
+                pos=pos,
+                exit_price=cur_price,
+                reason="EOD",
+                now_iso=now_ist.isoformat(),
+                pnl=pnl,
+            )
             cycle_log["closed"].append({
                 "ticker": ticker, "reason": "EOD",
                 "pnl": round(pnl, 2), "exit_price": round(cur_price, 2),
@@ -167,12 +209,14 @@ def run_cycle(bot_id: str, df_5m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
             cost  = pos["entry_price"] * pos["qty"] * ROUND_TRIP_COST
             pnl   = ((exit_price - pos["entry_price"]) * pos["qty"] * direction) - cost
             capital += pnl
-            _insert_trade(bot_id, {
-                "ticker": ticker, "direction": "BUY" if direction == 1 else "SELL",
-                "entry_price": pos["entry_price"], "exit_price": round(exit_price, 2),
-                "qty": pos["qty"], "pnl": round(pnl, 2), "reason": reason,
-                "exit_time": now_ist.isoformat(),
-            })
+            _close_position_atomic(
+                bot_id=bot_id,
+                pos=pos,
+                exit_price=exit_price,
+                reason=reason,
+                now_iso=now_ist.isoformat(),
+                pnl=pnl,
+            )
             to_close.append(ticker)
             cycle_log["closed"].append({
                 "ticker": ticker, "reason": reason,
@@ -219,6 +263,7 @@ def run_cycle(bot_id: str, df_5m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
         return cycle_log
 
     capital_in_use    = sum(p["entry_price"] * p["qty"] for p in pos_map.values())
+    max_exposure_cap  = max(0.0, capital * MAX_PORTFOLIO_EXPOSURE)
     available_capital = max(0.0, capital - capital_in_use)
     per_pos_cap       = available_capital / n_new
     opened            = 0
@@ -249,8 +294,17 @@ def run_cycle(bot_id: str, df_5m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
         risk_amount    = capital * RISK_PER_TRADE
         risk_per_share = entry_price * sl_pct
         qty_by_risk    = max(MIN_SHARES, int(risk_amount / (risk_per_share + 1e-9)))
-        qty_by_cap     = max(MIN_SHARES, int(per_pos_cap / entry_price))
+        qty_by_cap_raw = int(per_pos_cap / entry_price)
+        if qty_by_cap_raw <= 0:
+            continue
+        qty_by_cap     = qty_by_cap_raw
         qty            = min(qty_by_risk, qty_by_cap)
+        if qty < MIN_SHARES:
+            continue
+
+        invested = entry_price * qty
+        if (capital_in_use + invested) > max_exposure_cap:
+            continue
 
         sl = entry_price * (1 - sl_pct) if sig == 1 else entry_price * (1 + sl_pct)
         tp = entry_price * (1 + tp_pct) if sig == 1 else entry_price * (1 - tp_pct)
@@ -269,6 +323,7 @@ def run_cycle(bot_id: str, df_5m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
             "entry_time":           now_ist.isoformat(),
         }
         _upsert_position(bot_id, pos_row)
+        capital_in_use += invested
         opened += 1
 
         cycle_log["new_entries"].append({

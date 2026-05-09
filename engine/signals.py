@@ -150,6 +150,11 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
             continue
 
         # Build full training feature vector in exact order expected by scaler/models.
+        available = [c for c in feature_cols if c in tick_df.columns]
+        min_needed = max(5, int(len(feature_cols) * 0.2))
+        if len(available) < min_needed:
+            # Not enough feature overlap; skip this ticker to avoid garbage inference.
+            continue
         feature_frame = (
             tick_df.reindex(columns=feature_cols)
             .replace([np.inf, -np.inf], np.nan)
@@ -180,7 +185,7 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
             "confidence": round(conf, 2),
             "close":      float(tick_df["close"].iloc[-1]),
             "news_score": 0.0,   # News sentiment added later if needed
-            "combined":   round(prob * 0.7, 4),
+            "combined":   round((conf / 100.0) * 0.7, 4),
         })
 
     if not rows:
