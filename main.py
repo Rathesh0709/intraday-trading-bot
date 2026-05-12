@@ -726,8 +726,9 @@ def create_bot(
         _raise_api_error(e, "Create bot failed")
 
 @app.post("/bot/{bot_id}/start")
-def start_bot(
+async def start_bot(
     bot_id: str,
+    background_tasks: BackgroundTasks,
     user_id: Optional[UUID] = Query(default=None),
     auth_user_id: UUID = Depends(_get_current_user_id),
 ):
@@ -736,11 +737,55 @@ def start_bot(
         _require_bot_access(bot_id, effective_user)
         sb = get_supabase()
         sb.table("bot_instances").update({"status": "running"}).eq("id", bot_id).execute()
-        return {"message": f"Bot {bot_id} started"}
+        
+        # Trigger immediate run for this bot
+        background_tasks.add_task(_run_single_bot_cycle_task, bot_id)
+        
+        return {"message": f"Bot {bot_id} started and immediate cycle triggered"}
     except HTTPException:
         raise
     except Exception as e:
         _raise_api_error(e, "Start bot failed")
+
+async def _run_single_bot_cycle_task(bot_id: str):
+    """Background task to run a single bot cycle immediately."""
+    print(f"[ImmediateRun] Starting cycle for bot {bot_id}")
+    try:
+        from engine.data import fetch_live_candles
+        # Fetch data for all NIFTY 50 (standard behavior)
+        df_5m, df_1h = fetch_live_candles(NIFTY_50_TICKERS)
+        
+        cycle_started_at = datetime.utcnow()
+        log = run_cycle(bot_id, df_5m, df_1h)
+        cycle_completed_at = datetime.utcnow()
+        
+        execution_ms = int((cycle_completed_at - cycle_started_at).total_seconds() * 1000)
+        
+        # We don't have a 'mode' easily here without fetching bot info again, 
+        # but run_cycle returns enough info for the log.
+        structured = {
+            "event": "cycle_complete",
+            "bot_id": bot_id,
+            "status": "ok",
+            "started_at": cycle_started_at.isoformat() + "Z",
+            "completed_at": cycle_completed_at.isoformat() + "Z",
+            "execution_ms": execution_ms,
+            "cycle": log,
+            "is_immediate": True
+        }
+        _safe_insert_cycle_log(bot_id, structured)
+        print(f"[ImmediateRun] Finished cycle for bot {bot_id}")
+    except Exception as e:
+        print(f"[ImmediateRun] Failed cycle for bot {bot_id}: {e}")
+        # Log error
+        structured = {
+            "event": "cycle_complete",
+            "bot_id": bot_id,
+            "status": "error",
+            "error_message": str(e),
+            "is_immediate": True
+        }
+        _safe_insert_cycle_log(bot_id, structured)
 
 @app.post("/bot/{bot_id}/stop")
 def stop_bot(
@@ -871,9 +916,18 @@ def get_bot_dashboard(
                 "unrealized_pnl": round(unrealized, 2),
             })
 
+        # Fetch recent logs for this bot
+        recent_logs = sb.table("bot_cycle_logs") \
+            .select("*") \
+            .eq("bot_id", bot_id) \
+            .order("created_at", desc=True) \
+            .limit(30) \
+            .execute()
+
         return {
             "bot": bot.data,
             "positions": enriched_positions,
+            "logs": recent_logs.data or [],
             "stats": {
                 "open_positions": len(enriched_positions),
                 "trades_today": len(today_trades),

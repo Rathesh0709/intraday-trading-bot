@@ -49,10 +49,23 @@ def _upsert_position(bot_id: str, pos: dict):
     sb = get_supabase()
     existing = sb.table("positions").select("id")\
         .eq("bot_id", bot_id).eq("ticker", pos["ticker"]).execute()
-    if existing.data:
-        sb.table("positions").update(pos).eq("id", existing.data[0]["id"]).execute()
-    else:
-        sb.table("positions").insert({**pos, "bot_id": bot_id}).execute()
+    
+    try:
+        if existing.data:
+            sb.table("positions").update(pos).eq("id", existing.data[0]["id"]).execute()
+        else:
+            sb.table("positions").insert({**pos, "bot_id": bot_id}).execute()
+    except Exception as e:
+        msg = str(e).lower()
+        if "atr" in msg and ("column" in msg or "not find" in msg):
+            print(f"[PaperEngine] 'atr' column missing in DB, retrying without it.")
+            pos_no_atr = {k: v for k, v in pos.items() if k != "atr"}
+            if existing.data:
+                sb.table("positions").update(pos_no_atr).eq("id", existing.data[0]["id"]).execute()
+            else:
+                sb.table("positions").insert({**pos_no_atr, "bot_id": bot_id}).execute()
+        else:
+            raise e
 
 
 def _delete_position(bot_id: str, ticker: str):
