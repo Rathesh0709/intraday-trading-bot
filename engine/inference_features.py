@@ -467,8 +467,8 @@ def merge_macro_features(df: pd.DataFrame) -> pd.DataFrame:
         close_col = next((c for c in possible_cols if c in macro.columns), None)
         if close_col:
             macro[prefix] = macro[close_col]
-            macro[f"{prefix}_ret1d"] = macro[close_col].pct_change(1)
-            macro[f"{prefix}_ret5d"] = macro[close_col].pct_change(5)
+            macro[f"{prefix}_ret1d"] = macro[close_col].pct_change(1, fill_method=None)
+            macro[f"{prefix}_ret5d"] = macro[close_col].pct_change(5, fill_method=None)
         else:
             macro[prefix] = 0.0
             macro[f"{prefix}_ret1d"] = 0.0

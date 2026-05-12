@@ -15,6 +15,7 @@ from engine.config import (
     LOOKBACK, MIN_CONFIDENCE, MIN_CONFIDENCE_SHORT,
     INFERENCE_TAIL_BARS,
     NEWS_BLOCK_THRESHOLD,
+    NEWS_CONFIRM_THRESHOLD,
     XGB_MODEL_CANDIDATES, LGB_MODEL_CANDIDATES, CAT_MODEL_CANDIDATES,
     TCN_MODEL_CANDIDATES, SCALER_CANDIDATES, FEATURE_COLS_CANDIDATES,
 )
@@ -153,12 +154,20 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
         "picks_before_news_filter": 0,
         "inference_tail_bars": INFERENCE_TAIL_BARS,
         "live_news_enabled": True,
+        "signal_buy_threshold": 0.54,
+        "signal_sell_threshold": 0.46,
     }
 
     models = load_models()
     scaler      = models["scaler"]
     feature_cols = models["feature_cols"]
     meta["feature_cols_count"] = len(feature_cols)
+
+    # Match `stock_trading_bot.py` live classification thresholds.
+    buy_thr = float(os.environ.get("SIGNAL_BUY_THRESHOLD", "0.54"))
+    sell_thr = float(os.environ.get("SIGNAL_SELL_THRESHOLD", "0.46"))
+    meta["signal_buy_threshold"] = buy_thr
+    meta["signal_sell_threshold"] = sell_thr
 
     rows = []
     max_buy_prob = -1.0
@@ -195,7 +204,8 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
             continue
 
         try:
-            X_all = scaler.transform(feature_frame)
+            # Avoid sklearn warning about feature names by passing ndarray.
+            X_all = scaler.transform(feature_frame.to_numpy())
             prob = float(_ensemble_predict_window(X_all, models))
         except Exception:
             meta["model_errors"] += 1
@@ -204,15 +214,18 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
         max_buy_prob = max(max_buy_prob, prob)
         max_short_strength = max(max_short_strength, 1.0 - prob)
 
-        if prob >= MIN_CONFIDENCE / 100:
+        # Step 1 in stock bot: decide BUY/SELL/HOLD from prob band.
+        if prob > buy_thr:
             signal = "BUY"
-            conf   = prob * 100
-        elif (1 - prob) >= MIN_CONFIDENCE_SHORT / 100:
+        elif prob < sell_thr:
             signal = "SELL"
-            conf   = (1 - prob) * 100
         else:
+            # HOLD — skip from tradeable list (but track it)
             meta["skipped_low_confidence"] += 1
             continue
+
+        # Confidence = max(prob, 1-prob) like stock bot.
+        conf = max(prob, 1.0 - prob) * 100.0
 
         rows.append({
             "ticker":     ticker,
@@ -220,7 +233,8 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
             "confidence": round(conf, 2),
             "close":      float(tick_df["close"].iloc[-1]),
             "news_score": 0.0,   # News sentiment added later if needed
-            "combined":   round((conf / 100.0) * 0.7, 4),
+            "prob_up":    round(prob, 6),
+            "combined":   round(0.70 * prob, 4),
         })
 
     meta["max_buy_prob"] = round(max_buy_prob, 4) if max_buy_prob >= 0 else None
@@ -230,8 +244,13 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
         meta["picks_after_news_filter"] = 0
         return pd.DataFrame(), meta
 
-    picks = pd.DataFrame(rows).sort_values("combined", ascending=False)
-    meta["picks_before_news_filter"] = int(len(picks))
+    scores = pd.DataFrame(rows)
+
+    # Step 5 in stock bot: enforce confidence thresholds (after we have BUY/SELL).
+    buy_cands = scores[(scores["signal"] == "BUY") & (scores["confidence"] >= MIN_CONFIDENCE)].copy()
+    sell_cands = scores[(scores["signal"] == "SELL") & (scores["confidence"] >= MIN_CONFIDENCE_SHORT)].copy()
+    picks = pd.concat([buy_cands, sell_cands], ignore_index=True) if (not buy_cands.empty or not sell_cands.empty) else pd.DataFrame()
+    meta["picks_before_news_filter"] = int(len(picks)) if not picks.empty else 0
 
     # ── Live news sentiment (70% model + 30% news), like stock_trading_bot.py ──
     use_live_news = os.environ.get("USE_LIVE_NEWS", "1").strip().lower() not in (
@@ -254,16 +273,20 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
         news_norm = (picks["news_score"].astype(float) + 1.0) / 2.0
         news_norm = np.where(picks["signal"] == "SELL", 1.0 - news_norm, news_norm)
 
-        # Reconstruct prob_up from confidence+signal
-        conf01 = picks["confidence"].astype(float) / 100.0
-        prob_up = np.where(picks["signal"] == "BUY", conf01, 1.0 - conf01)
+        prob_up = picks["prob_up"].astype(float).to_numpy()
         picks["combined"] = np.round(0.70 * prob_up + 0.30 * news_norm, 4)
         picks = picks.sort_values("combined", ascending=False).reset_index(drop=True)
 
-    # Block BUY signals with very negative news
-    picks = picks[
-        ~((picks["signal"] == "BUY") & (picks["news_score"] < NEWS_BLOCK_THRESHOLD))
-    ].reset_index(drop=True)
+    # Block trades where news contradicts signal (match stock bot):
+    # - BUY blocked on bearish news
+    # - SELL blocked on bullish news
+    if not picks.empty:
+        picks = picks[
+            ~(
+                ((picks["signal"] == "BUY") & (picks["news_score"] < NEWS_BLOCK_THRESHOLD))
+                | ((picks["signal"] == "SELL") & (picks["news_score"] > NEWS_CONFIRM_THRESHOLD))
+            )
+        ].reset_index(drop=True)
 
     meta["picks_after_news_filter"] = int(len(picks))
     return picks, meta
