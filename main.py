@@ -566,22 +566,73 @@ async def scheduled_paper_run():
     finally:
         SCHEDULER_CYCLE_IN_PROGRESS = False
 
+def _refresh_reference_data_job():
+    """
+    Refresh nifty50_stocks_daily.csv + macro_sentiment.csv from yfinance.
+    Runs at 09:00 IST every weekday so the CSVs never go stale.
+    These are needed at INFERENCE time (not just training) because the feature
+    pipeline uses them to compute pivot levels and pdh/pdl/pdc features.
+    """
+    try:
+        from scripts.refresh_bot_reference_data import refresh_daily_panel, refresh_macro_sentiment
+        print("[RefreshJob] Refreshing nifty50_stocks_daily.csv ...")
+        refresh_daily_panel(years=3)
+        print("[RefreshJob] Refreshing macro_sentiment.csv ...")
+        refresh_macro_sentiment(years=3)
+        print("[RefreshJob] Reference CSVs refreshed successfully.")
+    except Exception as e:
+        print(f"[RefreshJob] Reference data refresh failed (non-fatal): {e}")
+
+
+def _warn_if_stale_csv():
+    """Log a warning at startup if the daily CSV is already stale (>3 days old)."""
+    try:
+        from engine.config import get_bot_data_dir, NIFTY_DAILY_CSV
+        import pandas as pd
+        from datetime import date
+        path = get_bot_data_dir() / NIFTY_DAILY_CSV
+        if not path.is_file():
+            print("[App] WARNING: nifty50_stocks_daily.csv not found — pivot/pdh features will be zero!")
+            return
+        df = pd.read_csv(path, index_col=0, parse_dates=True, nrows=1000)
+        last_date = pd.to_datetime(df.index).max().date()
+        gap = (date.today() - last_date).days
+        if gap > 3:
+            print(f"[App] WARNING: nifty50_stocks_daily.csv is {gap} days stale (ends {last_date}). "
+                  f"Pivot/pdh features will use last known values via ffill. "
+                  f"Schedule refresh_bot_reference_data.py or wait for 09:00 IST refresh job.")
+        else:
+            print(f"[App] nifty50_stocks_daily.csv is current (ends {last_date}, {gap}d ago). OK.")
+    except Exception as e:
+        print(f"[App] Could not check CSV staleness: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start scheduler on app startup
-    # Run at minute 16 of hours 10, 11, 12, 13, 14, 15 IST
-    # Note: APScheduler uses server timezone by default. Ensure server is IST or configure explicitly.
+    # ── Startup staleness check ──────────────────────────────────────────────
+    _warn_if_stale_csv()
+
+    # ── Scheduler ────────────────────────────────────────────────────────────
+    # Trading cycles: minute 16 of hours 10-15 IST
+    # Reference data refresh: 09:00 IST every weekday (before market open)
     try:
         from pytz import timezone
         ist = timezone('Asia/Kolkata')
         scheduler.add_job(scheduled_paper_run, 'cron', hour='10-15', minute='16', timezone=ist)
+        scheduler.add_job(
+            _refresh_reference_data_job, 'cron',
+            day_of_week='mon-fri', hour=9, minute=0,
+            timezone=ist,
+            id='daily_csv_refresh',
+            replace_existing=True,
+        )
         scheduler.start()
-        print("[App] Scheduler started.")
+        print("[App] Scheduler started (trading cycles + daily CSV refresh at 09:00 IST).")
     except Exception as e:
         print(f"[App] Failed to start scheduler: {e}")
-        
+
     yield
-    
+
     # Shutdown
     scheduler.shutdown()
     print("[App] Scheduler stopped.")

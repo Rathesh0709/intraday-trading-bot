@@ -130,22 +130,46 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _merge_daily_pivots(df: pd.DataFrame, daily_pivot_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge daily pivot levels into the intraday df.
+    Uses merge_asof (backward fill) so a stale CSV always carries its last
+    known values forward — exact date join would produce all-NaN for any date
+    past the CSV's end.
+    """
     idx_tz = df.index.tz
     df_no_tz = df.copy()
     df_no_tz.index = df_no_tz.index.tz_localize(None)
+
     pivot_shifted = daily_pivot_df.shift(1)
     pivot_idx = pd.to_datetime(pivot_shifted.index)
+    # tz_convert(None) is correct for tz-aware → tz-naive; tz_localize(None) raises on aware
     if pivot_idx.tz is not None:
-        pivot_idx = pivot_idx.tz_localize(None)
+        pivot_idx = pivot_idx.tz_convert(None)
     pivot_shifted.index = pivot_idx.normalize()
+
     df_no_tz["_date"] = df_no_tz.index.normalize()
-    merged = df_no_tz.join(pivot_shifted, on="_date", how="left", rsuffix="_pv")
-    merged.drop(columns=["_date"], inplace=True)
-    merged.index = df_no_tz.index
-    merged.index = merged.index.tz_localize(idx_tz)
-    for col in daily_pivot_df.columns:
-        if col in merged.columns:
-            merged[col] = merged[col].ffill()
+
+    # --- merge_asof (backward) replaces the old exact join ---
+    # This means if the CSV ends 2026-03-27, live dates in May 2026 get
+    # Mar-27 pivot values instead of zero — far better for the model.
+    pivot_cols = [c for c in pivot_shifted.columns if c not in df_no_tz.columns]
+    pivot_for_merge = pivot_shifted[pivot_cols].copy()
+    pivot_for_merge["_date"] = pivot_shifted.index
+    pivot_for_merge = pivot_for_merge.sort_values("_date")
+
+    df_sorted = df_no_tz.sort_values("_date")
+    merged = pd.merge_asof(
+        df_sorted,
+        pivot_for_merge,
+        on="_date",
+        direction="backward",
+    )
+    # Restore original row order and index
+    merged = merged.drop(columns=["_date"])
+    merged.index = df_sorted.index  # tz-naive
+    merged = merged.reindex(df_no_tz.index)  # restore original order
+    if idx_tz is not None:
+        merged.index = merged.index.tz_localize(idx_tz)
     return merged
 
 
@@ -344,10 +368,27 @@ def add_nifty_specific_features(df: pd.DataFrame, daily: pd.DataFrame) -> pd.Dat
         if not tick_daily.empty:
             d = tick_daily.copy()
             d.index = pd.to_datetime(d.index).normalize()
+            # Strip tz so reindex works regardless of whether the CSV index is
+            # tz-aware (Asia/Kolkata) or tz-naive. tz_localize(None) fails on
+            # tz-aware; tz_convert(None) is the correct call.
+            if d.index.tz is not None:
+                d.index = d.index.tz_convert(None)
             df_date = group.index.normalize().tz_localize(None)
-            group["pdh"] = d["high"].shift(1).reindex(df_date).values
-            group["pdl"] = d["low"].shift(1).reindex(df_date).values
-            group["pdc"] = d["close"].shift(1).reindex(df_date).values
+            # shift(1) → previous calendar day; merge_asof-style ffill so that
+            # dates beyond the CSV end (stale) still carry the last known value
+            # instead of producing NaN → 0.
+            pdh_s = d["high"].shift(1)
+            pdl_s = d["low"].shift(1)
+            pdc_s = d["close"].shift(1)
+            # Build a combined index: historical dates + unique live dates, then
+            # ffill over the full range before picking just the live rows.
+            # This ensures values carry forward even when the live date is well
+            # past the CSV end date (e.g. CSV ends Mar-27, live is May-12).
+            live_dates_unique = pd.Index(df_date.unique())
+            combined_idx = pdh_s.index.append(live_dates_unique).unique().sort_values()
+            group["pdh"] = pdh_s.reindex(combined_idx).ffill().reindex(df_date).values
+            group["pdl"] = pdl_s.reindex(combined_idx).ffill().reindex(df_date).values
+            group["pdc"] = pdc_s.reindex(combined_idx).ffill().reindex(df_date).values
         else:
             group["pdh"] = np.nan
             group["pdl"] = np.nan

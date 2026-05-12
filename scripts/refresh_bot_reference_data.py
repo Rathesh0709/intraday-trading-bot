@@ -74,7 +74,7 @@ def refresh_daily_panel(years: int = 5) -> Path:
     full = pd.concat(rows, axis=0).sort_index()
     full.index.name = "datetime"
     full.to_csv(dest)
-    print(f"Wrote {len(full):,} rows → {dest}")
+    print(f"Wrote {len(full):,} rows -> {dest}")
     return dest
 
 
@@ -120,7 +120,7 @@ def refresh_macro_sentiment(years: int = 5) -> Path:
     # Match legacy file: first column name Date for readability (index written as first col)
     combined.index.name = "Date"
     combined.to_csv(dest)
-    print(f"Wrote macro panel {combined.shape} → {dest}")
+    print(f"Wrote macro panel {combined.shape} -> {dest}")
     return dest
 
 
@@ -131,7 +131,7 @@ def main() -> None:
     p.add_argument("--years", type=int, default=5)
     args = p.parse_args()
 
-    print(f"BOT_DATA_DIR → {get_bot_data_dir()}")
+    print(f"BOT_DATA_DIR -> {get_bot_data_dir()}")
     if not args.macro_only:
         refresh_daily_panel(years=args.years)
     if not args.daily_only:
