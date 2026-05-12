@@ -14,6 +14,9 @@ import logging
 from contextlib import redirect_stderr
 import requests
 
+from engine.features_live import enrich_intraday_panel, stub_missing_master_columns
+from engine.bot_training_mirror import apply_stock_bot_1h_panel
+
 _HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -37,7 +40,8 @@ def _process_ticker_raw(ticker: str, raw: pd.DataFrame) -> tuple[pd.DataFrame, p
         raw.index = raw.index.tz_convert("Asia/Kolkata")
 
     raw["ticker"] = ticker
-    raw = _with_indicators(raw)
+
+    raw = enrich_intraday_panel(raw)
 
     # Resample to 1h
     ohlc_1h = raw.resample("1h", closed="right", label="right").agg(
@@ -45,8 +49,10 @@ def _process_ticker_raw(ticker: str, raw: pd.DataFrame) -> tuple[pd.DataFrame, p
         low=("low", "min"), close=("close", "last"),
         volume=("volume", "sum"),
     ).dropna(subset=["close"])
-    ohlc_1h = _with_indicators(ohlc_1h)
     ohlc_1h["ticker"] = ticker
+    ohlc_1h = apply_stock_bot_1h_panel(ohlc_1h)
+    ohlc_1h = stub_missing_master_columns(ohlc_1h)
+    ohlc_1h = ohlc_1h.replace([np.inf, -np.inf], np.nan)
     return raw, ohlc_1h
 
 
@@ -103,49 +109,6 @@ def _download_from_chart_api(
     df = df.iloc[: len(ts)].copy()
     df.index = pd.DatetimeIndex(ts.iloc[: len(df)])
     return df
-
-
-def _with_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        return out
-    close = out["close"].astype(float)
-    high = out["high"].astype(float)
-    low = out["low"].astype(float)
-    vol = out["volume"].astype(float)
-
-    out["ret_1"] = close.pct_change(1)
-    out["ret_3"] = close.pct_change(3)
-    out["ret_5"] = close.pct_change(5)
-    out["sma_5"] = close.rolling(5).mean()
-    out["sma_10"] = close.rolling(10).mean()
-    out["ema_5"] = close.ewm(span=5, adjust=False).mean()
-    out["ema_10"] = close.ewm(span=10, adjust=False).mean()
-    out["volatility_10"] = out["ret_1"].rolling(10).std()
-    out["volume_z_10"] = (vol - vol.rolling(10).mean()) / (vol.rolling(10).std() + 1e-9)
-
-    # RSI(14)
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / (avg_loss + 1e-9)
-    out["rsi_14"] = 100 - (100 / (1 + rs))
-
-    # ATR(14)
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    out["atr"] = tr.rolling(14).mean()
-    out["atr_14"] = out["atr"]
-    return out.replace([np.inf, -np.inf], np.nan)
 
 
 def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:

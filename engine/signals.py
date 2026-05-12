@@ -13,6 +13,7 @@ import pandas as pd
 from typing import Optional
 from engine.config import (
     LOOKBACK, MIN_CONFIDENCE, MIN_CONFIDENCE_SHORT,
+    INFERENCE_TAIL_BARS,
     NEWS_BLOCK_THRESHOLD,
     XGB_MODEL_CANDIDATES, LGB_MODEL_CANDIDATES, CAT_MODEL_CANDIDATES,
     TCN_MODEL_CANDIDATES, SCALER_CANDIDATES, FEATURE_COLS_CANDIDATES,
@@ -140,18 +141,19 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
         "tickers_requested": len(tickers),
         "skipped_short_history": 0,
         "skipped_no_close": 0,
-        "skipped_feature_overlap": 0,
         "skipped_empty_frame": 0,
         "model_errors": 0,
         "skipped_low_confidence": 0,
         "rows_5m_for_first_ticker": None,
         "feature_cols_count": 0,
-        "min_feature_overlap": 0,
+        "feature_columns_native_present": None,
+        "feature_columns_zero_filled": None,
         "max_buy_prob": None,
         "max_short_strength": None,
         "min_confidence_buy_pct": MIN_CONFIDENCE,
         "min_confidence_short_pct": MIN_CONFIDENCE_SHORT,
         "picks_before_news_filter": 0,
+        "inference_tail_bars": INFERENCE_TAIL_BARS,
     }
 
     models = load_models()
@@ -165,7 +167,7 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
     first_ticker = tickers[0] if tickers else None
 
     for ticker in tickers:
-        tick_df = df_5m[df_5m["ticker"] == ticker].sort_index().tail(LOOKBACK + 5)
+        tick_df = df_5m[df_5m["ticker"] == ticker].sort_index().tail(INFERENCE_TAIL_BARS)
         if first_ticker is not None and ticker == first_ticker:
             meta["rows_5m_for_first_ticker"] = int(len(tick_df))
 
@@ -177,14 +179,13 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFr
             meta["skipped_no_close"] += 1
             continue
 
-        # Build full training feature vector in exact order expected by scaler/models.
-        available = [c for c in feature_cols if c in tick_df.columns]
-        min_needed = max(5, int(len(feature_cols) * 0.2))
-        meta["min_feature_overlap"] = min_needed
-        if len(available) < min_needed:
-            # Not enough feature overlap; skip this ticker to avoid garbage inference.
-            meta["skipped_feature_overlap"] += 1
-            continue
+        present = [c for c in feature_cols if c in tick_df.columns]
+        if first_ticker is not None and ticker == first_ticker:
+            meta["feature_columns_native_present"] = len(present)
+            meta["feature_columns_zero_filled"] = len(feature_cols) - len(present)
+
+        # Align to training column order; missing live-only columns become 0 (same as training
+        # fill for macro/pivot/news when unavailable).
         feature_frame = (
             tick_df.reindex(columns=feature_cols)
             .replace([np.inf, -np.inf], np.nan)
