@@ -574,7 +574,7 @@ async def lifespan(app: FastAPI):
     try:
         from pytz import timezone
         ist = timezone('Asia/Kolkata')
-        scheduler.add_job(scheduled_paper_run, 'cron', hour='9-16', minute='*/5', timezone=ist)
+        scheduler.add_job(scheduled_paper_run, 'cron', hour='10-15', minute='16', timezone=ist)
         scheduler.start()
         print("[App] Scheduler started.")
     except Exception as e:
