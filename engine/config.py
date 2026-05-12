@@ -3,6 +3,27 @@
 # ═══════════════════════════════════════════════════════════════════
 
 import os
+from pathlib import Path
+
+# Reference CSVs used at inference (see scripts/refresh_bot_reference_data.py).
+NIFTY_DAILY_CSV = "nifty50_stocks_daily.csv"
+MACRO_SENTIMENT_CSV = "macro_sentiment.csv"
+ANNOUNCEMENTS_CSV = "nse_announcements_full.csv"
+
+
+def get_bot_data_dir() -> Path:
+    """
+    Directory where optional reference CSVs live.
+
+    Set env **BOT_DATA_DIR** to an absolute path on the server (e.g. Railway volume).
+    If unset, defaults to the **monorepo root** (parent of `trading-app-backend/`),
+    which matches local development when the full repo is checked out.
+    """
+    raw = os.environ.get("BOT_DATA_DIR", "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    # engine/config.py → …/trading-app-backend/engine → …/trading-app-backend → monorepo root
+    return Path(__file__).resolve().parent.parent.parent
 
 
 def _env_float(name: str, default: float) -> float:

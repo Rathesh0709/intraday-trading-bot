@@ -4,6 +4,7 @@ Fetches 5m candles for the last 7 days and resamples to 1h.
 """
 
 from __future__ import annotations
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -14,8 +15,25 @@ import logging
 from contextlib import redirect_stderr
 import requests
 
-from engine.features_live import enrich_intraday_panel, stub_missing_master_columns
-from engine.bot_training_mirror import apply_stock_bot_1h_panel
+from engine.features_live import enrich_intraday_panel, enrich_1h_panel
+
+logger = logging.getLogger(__name__)
+
+
+def _prefer_yahoo_chart_api() -> bool:
+    """
+    Prefer Yahoo's chart JSON endpoint over yfinance when cloud egress blocks downloads.
+
+    - PREFER_YAHOO_CHART_API=0 forces yfinance-first (local dev).
+    - PREFER_YAHOO_CHART_API=1 forces chart-first.
+    - Default on Railway: chart-first (see RAILWAY_* env).
+    """
+    v = os.environ.get("PREFER_YAHOO_CHART_API", "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
 
 _HTTP_HEADERS = {
     "User-Agent": (
@@ -50,9 +68,7 @@ def _process_ticker_raw(ticker: str, raw: pd.DataFrame) -> tuple[pd.DataFrame, p
         volume=("volume", "sum"),
     ).dropna(subset=["close"])
     ohlc_1h["ticker"] = ticker
-    ohlc_1h = apply_stock_bot_1h_panel(ohlc_1h)
-    ohlc_1h = stub_missing_master_columns(ohlc_1h)
-    ohlc_1h = ohlc_1h.replace([np.inf, -np.inf], np.nan)
+    ohlc_1h = enrich_1h_panel(ohlc_1h)
     return raw, ohlc_1h
 
 
@@ -138,8 +154,8 @@ def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
     rows_5m, rows_1h, failed = [], [], []
     pending = list(dict.fromkeys(tickers))
 
-    # First try a bulk download to reduce provider throttling.
-    if pending:
+    # First try a bulk download to reduce provider throttling (skip when using chart API mode).
+    if pending and not _prefer_yahoo_chart_api():
         try:
             with redirect_stderr(io.StringIO()):
                 bulk = yf.download(
@@ -175,28 +191,40 @@ def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
     for ticker in pending:
         try:
             raw = pd.DataFrame()
+            # Optional: chart endpoint first (often works when yfinance is throttled on VPS IPs).
+            if _prefer_yahoo_chart_api():
+                for attempt in range(3):
+                    try:
+                        raw = _download_from_chart_api(ticker, interval="5m", range_="7d")
+                        if not raw.empty:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.5 * (attempt + 1))
+
             # Retry with small backoff for transient provider/network failures.
-            for attempt in range(3):
-                try:
-                    with redirect_stderr(io.StringIO()):
-                        raw = yf.download(
-                            ticker,
-                            start=start_str,
-                            end=end_str,
-                            interval="5m",
-                            progress=False,
-                            auto_adjust=True,
-                            threads=False,
-                        )
-                    if not raw.empty:
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.6 * (attempt + 1))
+            if raw.empty:
+                for attempt in range(3):
+                    try:
+                        with redirect_stderr(io.StringIO()):
+                            raw = yf.download(
+                                ticker,
+                                start=start_str,
+                                end=end_str,
+                                interval="5m",
+                                progress=False,
+                                auto_adjust=True,
+                                threads=False,
+                            )
+                        if not raw.empty:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.6 * (attempt + 1))
 
             # Alternate data source path (chart API direct) if yfinance failed.
-            if raw.empty:
-                for attempt in range(2):
+            if raw.empty and not _prefer_yahoo_chart_api():
+                for attempt in range(3):
                     try:
                         raw = _download_from_chart_api(ticker, interval="5m", range_="7d")
                         if not raw.empty:
@@ -219,6 +247,13 @@ def fetch_live_candles(tickers: List[str]) -> dict[str, pd.DataFrame]:
 
     df5  = pd.concat(rows_5m).sort_index() if rows_5m else pd.DataFrame()
     df1h = pd.concat(rows_1h).sort_index() if rows_1h else pd.DataFrame()
+
+    if df5.empty and tickers:
+        logger.warning(
+            "fetch_live_candles: no bars for any ticker (failed=%d). "
+            "If this repeats on a VPS, set PREFER_YAHOO_CHART_API=1 or verify network.",
+            len(failed),
+        )
 
     return {"5m": df5, "1h": df1h, "failed": failed}
 

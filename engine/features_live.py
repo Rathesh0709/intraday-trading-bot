@@ -7,11 +7,14 @@ names (missing macro/pivot/news columns are stubbed with 0 like empty-daily path
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 import pandas as pd
 import ta
 
-from engine.bot_training_mirror import apply_stock_bot_5m_panel
+from engine.bot_training_mirror import apply_stock_bot_1h_panel, apply_stock_bot_5m_panel
+
+logger = logging.getLogger(__name__)
 
 # Master list — must stay in sync with stock_trading_bot.py ALL_FEATURE_COLUMNS.
 ALL_FEATURE_COLUMNS = [
@@ -217,6 +220,14 @@ def stub_missing_master_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _legacy_enrich_intraday(df: pd.DataFrame) -> pd.DataFrame:
+    """Lightweight path when `stock_trading_bot.py` mirror is unavailable or raises."""
+    out = add_technical_indicators_live(df)
+    out = add_session_and_prevday_live(out)
+    out = stub_missing_master_columns(out)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
 def enrich_intraday_panel(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build training-aligned columns on OHLCV intraday data (one or many tickers).
@@ -228,6 +239,29 @@ def enrich_intraday_panel(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return df
-    out = apply_stock_bot_5m_panel(df)
+    try:
+        out = apply_stock_bot_5m_panel(df)
+    except Exception as e:
+        logger.warning(
+            "apply_stock_bot_5m_panel failed (%s); using legacy enrich. "
+            "Set STOCK_TRADING_BOT_PATH / BOT_DATA_DIR or fix training mirror.",
+            e,
+        )
+        out = _legacy_enrich_intraday(df)
+    out = stub_missing_master_columns(out)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def enrich_1h_panel(df: pd.DataFrame) -> pd.DataFrame:
+    """1h bars: same training mirror as bot, with legacy fallback."""
+    if df.empty:
+        return df
+    try:
+        out = apply_stock_bot_1h_panel(df)
+    except Exception as e:
+        logger.warning(
+            "apply_stock_bot_1h_panel failed (%s); using legacy enrich.", e,
+        )
+        out = _legacy_enrich_intraday(df)
     out = stub_missing_master_columns(out)
     return out.replace([np.inf, -np.inf], np.nan)
