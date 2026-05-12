@@ -57,13 +57,20 @@ def _upsert_position(bot_id: str, pos: dict):
             sb.table("positions").insert({**pos, "bot_id": bot_id}).execute()
     except Exception as e:
         msg = str(e).lower()
-        if "atr" in msg and ("column" in msg or "not find" in msg):
-            print(f"[PaperEngine] 'atr' column missing in DB, retrying without it.")
-            pos_no_atr = {k: v for k, v in pos.items() if k != "atr"}
+        # Handle cases where new columns (atr, confidence, etc.) are missing from older schemas
+        if "column" in msg or "not find" in msg or "pgrst204" in msg:
+            print(f"[PaperEngine] Schema mismatch detected, filtering payload to basic columns. Error: {e}")
+            # The confirmed columns in the user's Supabase 'positions' table
+            allowed_cols = {
+                "ticker", "entry_price", "qty", "direction", 
+                "sl", "tp", "entry_time"
+            }
+            pos_filtered = {k: v for k, v in pos.items() if k in allowed_cols}
+            
             if existing.data:
-                sb.table("positions").update(pos_no_atr).eq("id", existing.data[0]["id"]).execute()
+                sb.table("positions").update(pos_filtered).eq("id", existing.data[0]["id"]).execute()
             else:
-                sb.table("positions").insert({**pos_no_atr, "bot_id": bot_id}).execute()
+                sb.table("positions").insert({**pos_filtered, "bot_id": bot_id}).execute()
         else:
             raise e
 
@@ -74,7 +81,23 @@ def _delete_position(bot_id: str, ticker: str):
 
 
 def _insert_trade(bot_id: str, trade: dict):
-    get_supabase().table("trades").insert({**trade, "bot_id": bot_id}).execute()
+    """Insert a completed trade record."""
+    sb = get_supabase()
+    payload = {**trade, "bot_id": bot_id}
+    try:
+        sb.table("trades").insert(payload).execute()
+    except Exception as e:
+        msg = str(e).lower()
+        if "column" in msg or "not find" in msg or "pgrst204" in msg:
+            print(f"[PaperEngine] Trades schema mismatch, filtering payload. Error: {e}")
+            allowed_cols = {
+                "bot_id", "ticker", "direction", "entry_price", 
+                "exit_price", "qty", "pnl", "reason", "exit_time"
+            }
+            filtered = {k: v for k, v in payload.items() if k in allowed_cols}
+            sb.table("trades").insert(filtered).execute()
+        else:
+            raise e
 
 
 def _get_today_trades(bot_id: str, today_str: str) -> list[dict]:

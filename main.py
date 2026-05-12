@@ -751,9 +751,12 @@ async def _run_single_bot_cycle_task(bot_id: str):
     """Background task to run a single bot cycle immediately."""
     print(f"[ImmediateRun] Starting cycle for bot {bot_id}")
     try:
-        from engine.data import fetch_live_candles
         # Fetch data for all NIFTY 50 (standard behavior)
-        df_5m, df_1h = fetch_live_candles(NIFTY_50_TICKERS)
+        data = fetch_live_candles(NIFTY_50_TICKERS)
+        df_5m, df_1h = data["5m"], data["1h"]
+        
+        if df_5m.empty:
+            raise RuntimeError("Live data unavailable from provider (empty DataFrame).")
         
         cycle_started_at = datetime.utcnow()
         log = run_cycle(bot_id, df_5m, df_1h)
