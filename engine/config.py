@@ -2,11 +2,25 @@
 # engine/config.py  —  All trading constants in one place
 # ═══════════════════════════════════════════════════════════════════
 
+import os
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 INITIAL_CAPITAL      = 5_00_000
 MIN_SHARES           = 1
 TOP_K_STOCKS         = 10
-MIN_CONFIDENCE       = 58.0
-MIN_CONFIDENCE_SHORT = 60.0
+# Tunable via Railway env if the ensemble rarely clears the bar (e.g. scaler drift).
+MIN_CONFIDENCE       = _env_float("MIN_CONFIDENCE", 58.0)
+MIN_CONFIDENCE_SHORT = _env_float("MIN_CONFIDENCE_SHORT", 60.0)
 MAX_OPEN_POSITIONS   = 10
 RISK_PER_TRADE       = 0.02
 

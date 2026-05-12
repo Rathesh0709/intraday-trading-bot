@@ -129,31 +129,61 @@ def _ensemble_predict(X: np.ndarray, models: dict) -> np.ndarray:
     return ensemble
 
 
-def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFrame, dict]:
     """
     Generate BUY/SELL signals for the given tickers.
-    Returns a DataFrame with columns:
+    Returns (DataFrame, diagnostics dict). DataFrame columns:
       ticker, signal, confidence, close, news_score, combined
     sorted by combined score descending.
     """
+    meta: dict = {
+        "tickers_requested": len(tickers),
+        "skipped_short_history": 0,
+        "skipped_no_close": 0,
+        "skipped_feature_overlap": 0,
+        "skipped_empty_frame": 0,
+        "model_errors": 0,
+        "skipped_low_confidence": 0,
+        "rows_5m_for_first_ticker": None,
+        "feature_cols_count": 0,
+        "min_feature_overlap": 0,
+        "max_buy_prob": None,
+        "max_short_strength": None,
+        "min_confidence_buy_pct": MIN_CONFIDENCE,
+        "min_confidence_short_pct": MIN_CONFIDENCE_SHORT,
+        "picks_before_news_filter": 0,
+    }
+
     models = load_models()
     scaler      = models["scaler"]
     feature_cols = models["feature_cols"]
+    meta["feature_cols_count"] = len(feature_cols)
 
     rows = []
+    max_buy_prob = -1.0
+    max_short_strength = -1.0
+    first_ticker = tickers[0] if tickers else None
+
     for ticker in tickers:
         tick_df = df_5m[df_5m["ticker"] == ticker].sort_index().tail(LOOKBACK + 5)
+        if first_ticker is not None and ticker == first_ticker:
+            meta["rows_5m_for_first_ticker"] = int(len(tick_df))
+
         if len(tick_df) < LOOKBACK:
+            meta["skipped_short_history"] += 1
             continue
 
         if "close" not in tick_df.columns:
+            meta["skipped_no_close"] += 1
             continue
 
         # Build full training feature vector in exact order expected by scaler/models.
         available = [c for c in feature_cols if c in tick_df.columns]
         min_needed = max(5, int(len(feature_cols) * 0.2))
+        meta["min_feature_overlap"] = min_needed
         if len(available) < min_needed:
             # Not enough feature overlap; skip this ticker to avoid garbage inference.
+            meta["skipped_feature_overlap"] += 1
             continue
         feature_frame = (
             tick_df.reindex(columns=feature_cols)
@@ -161,6 +191,7 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
             .fillna(0.0)
         )
         if feature_frame.empty:
+            meta["skipped_empty_frame"] += 1
             continue
 
         try:
@@ -168,7 +199,11 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
             X_last = X_all[-1:].copy()
             prob = float(_ensemble_predict(X_last, models)[0])
         except Exception:
+            meta["model_errors"] += 1
             continue
+
+        max_buy_prob = max(max_buy_prob, prob)
+        max_short_strength = max(max_short_strength, 1.0 - prob)
 
         if prob >= MIN_CONFIDENCE / 100:
             signal = "BUY"
@@ -177,6 +212,7 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
             signal = "SELL"
             conf   = (1 - prob) * 100
         else:
+            meta["skipped_low_confidence"] += 1
             continue
 
         rows.append({
@@ -188,14 +224,20 @@ def generate_signals(df_5m: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
             "combined":   round((conf / 100.0) * 0.7, 4),
         })
 
+    meta["max_buy_prob"] = round(max_buy_prob, 4) if max_buy_prob >= 0 else None
+    meta["max_short_strength"] = round(max_short_strength, 4) if max_short_strength >= 0 else None
+
     if not rows:
-        return pd.DataFrame()
+        meta["picks_after_news_filter"] = 0
+        return pd.DataFrame(), meta
 
     picks = pd.DataFrame(rows).sort_values("combined", ascending=False)
+    meta["picks_before_news_filter"] = int(len(picks))
 
     # Block BUY signals with very negative news
     picks = picks[
         ~((picks["signal"] == "BUY") & (picks["news_score"] < NEWS_BLOCK_THRESHOLD))
     ].reset_index(drop=True)
 
-    return picks
+    meta["picks_after_news_filter"] = int(len(picks))
+    return picks, meta

@@ -247,7 +247,8 @@ def run_cycle(bot_id: str, df_5m: pd.DataFrame, df_1h: pd.DataFrame) -> dict:
         return cycle_log
 
     # ── Generate signals ─────────────────────────────────────────────────────
-    picks = generate_signals(df_5m, tickers)
+    picks, signal_meta = generate_signals(df_5m, tickers)
+    cycle_log["signals"] = signal_meta
     if picks.empty:
         cycle_log["held"] = [p["ticker"] for p in pos_map.values()]
         cycle_log["capital"] = capital
